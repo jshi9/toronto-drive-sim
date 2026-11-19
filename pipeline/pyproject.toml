@@ -1,0 +1,13 @@
+[project]
+name = "toronto-drive-sim-pipeline"
+version = "0.1.0"
+description = "Offline GIS and road-network pipeline for Toronto Drive Sim"
+requires-python = ">=3.11"
+dependencies = [
+    "osmnx",
+    "geopandas",
+    "shapely",
+    "pyproj",
+    "numpy",
+    "scipy",
+]

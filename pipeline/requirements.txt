@@ -1,0 +1,7 @@
+osmnx
+geopandas
+shapely
+pyproj
+numpy
+scipy
+osmium
