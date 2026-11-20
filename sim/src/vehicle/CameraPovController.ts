@@ -60,6 +60,9 @@ export class CameraPovController implements FloatingOriginListener {
   private readonly targetPos = new THREE.Vector3();
   private readonly lookTarget = new THREE.Vector3();
   private readonly focusPos = new THREE.Vector3();
+  private readonly scratchEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+  private readonly scratchVecA = new THREE.Vector3();
+  private readonly scratchVecB = new THREE.Vector3();
   private readonly onModeChange:
     | ((mode: CameraPovMode, fov: number) => void)
     | undefined;
@@ -260,30 +263,27 @@ export class CameraPovController implements FloatingOriginListener {
     }
 
     // Driving POV modes inside/around the car
-    const carEuler = new THREE.Euler(
-      car.getGroundPitchRad(),
-      baseYaw,
-      0,
-      'YXZ',
-    );
+    this.scratchEuler.set(car.getGroundPitchRad(), baseYaw, 0, 'YXZ');
     if (this.mode === 'first_person') {
       // Driver seat left-side eye position (x = -0.39 m, y = 1.15 m, z = 0.06 m)
-      const eyeOffset = new THREE.Vector3(-0.39, 1.15, 0.06).applyEuler(carEuler);
+      const eyeOffset = this.scratchVecA.set(-0.39, 1.15, 0.06).applyEuler(this.scratchEuler);
       this.camera.position.copy(this.focusPos).add(eyeOffset);
 
-      const lookLocal = new THREE.Vector3(
-        -Math.sin(this.orbitYawOffset) * 14,
-        -Math.sin(this.orbitPitchOffset + 0.06) * 14,
-        -Math.cos(this.orbitYawOffset) * 14,
-      ).applyEuler(carEuler);
+      const lookLocal = this.scratchVecB
+        .set(
+          -Math.sin(this.orbitYawOffset) * 14,
+          -Math.sin(this.orbitPitchOffset + 0.06) * 14,
+          -Math.cos(this.orbitYawOffset) * 14,
+        )
+        .applyEuler(this.scratchEuler);
       this.lookTarget.copy(this.camera.position).add(lookLocal);
       this.camera.lookAt(this.lookTarget);
       return;
     }
 
     if (this.mode === 'hood') {
-      const mount = new THREE.Vector3(0, 1.13, -0.78).applyEuler(carEuler);
-      const ahead = new THREE.Vector3(0, 0.96, -18).applyEuler(carEuler);
+      const mount = this.scratchVecA.set(0, 1.13, -0.78).applyEuler(this.scratchEuler);
+      const ahead = this.scratchVecB.set(0, 0.96, -18).applyEuler(this.scratchEuler);
       this.camera.position.copy(this.focusPos).add(mount);
       this.lookTarget.copy(this.focusPos).add(ahead);
       this.camera.lookAt(this.lookTarget);
@@ -291,8 +291,8 @@ export class CameraPovController implements FloatingOriginListener {
     }
 
     if (this.mode === 'bumper') {
-      const mount = new THREE.Vector3(0, 0.54, -2.22).applyEuler(carEuler);
-      const ahead = new THREE.Vector3(0, 0.56, -20).applyEuler(carEuler);
+      const mount = this.scratchVecA.set(0, 0.54, -2.22).applyEuler(this.scratchEuler);
+      const ahead = this.scratchVecB.set(0, 0.56, -20).applyEuler(this.scratchEuler);
       this.camera.position.copy(this.focusPos).add(mount);
       this.lookTarget.copy(this.focusPos).add(ahead);
       this.camera.lookAt(this.lookTarget);

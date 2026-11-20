@@ -283,9 +283,9 @@ export class Minimap {
   private readonly scaleLabelEl: HTMLSpanElement;
   private readonly compassBadgeEl: HTMLSpanElement;
   private readonly teleportBtn: HTMLButtonElement;
-  private northLockBtnFull!: HTMLButtonElement;
-  private labelsBtnFull!: HTMLButtonElement;
-  private gridBtnFull!: HTMLButtonElement;
+  private northLockBtnFull: HTMLButtonElement;
+  private labelsBtnFull: HTMLButtonElement;
+  private gridBtnFull: HTMLButtonElement;
   private readonly miniStyleBtns = new Map<MapViewStyle, HTMLButtonElement>();
   private readonly fullStyleBtns = new Map<MapViewStyle, HTMLButtonElement>();
   private readonly toastEl: HTMLDivElement;
@@ -303,7 +303,11 @@ export class Minimap {
 
     this.canvas = document.createElement('canvas');
     this.canvas.id = 'minimap-canvas';
-    this.ctx = this.canvas.getContext('2d')!;
+    const ctx = this.canvas.getContext('2d');
+    if (!ctx) {
+      throw new Error('Failed to acquire 2D canvas context for Minimap.');
+    }
+    this.ctx = ctx;
 
     this.miniHeader = document.createElement('div');
     this.miniStyleStrip = document.createElement('div');
@@ -1341,7 +1345,6 @@ export class Minimap {
     const strokeRoadBatch = (
       palette: readonly string[],
       widthPaddingWorld: number,
-      forceSingleColor?: string,
     ): void => {
       let currentStyle = '';
       let currentWidth = -1;
@@ -1351,10 +1354,9 @@ export class Minimap {
         const strokeW = Math.max(minStrokeWorld, road.w) + widthPaddingWorld;
         const qWidth = Math.round(strokeW * 4) * 0.25;
         const color =
-          forceSingleColor ??
-          (road.z > 0 && road.tier === 4
+          road.z > 0 && road.tier === 4
             ? palette[4]!
-            : palette[road.tier] ?? palette[1]!);
+            : palette[road.tier] ?? palette[1]!;
         if (color !== currentStyle || qWidth !== currentWidth) {
           if (currentStyle) {
             ctx.stroke();
@@ -1657,6 +1659,12 @@ export class Minimap {
       return;
     }
 
+    const rect = this.canvas.getBoundingClientRect();
+    const halfMinDim = Math.min(rect.width, rect.height) * 0.5;
+    if (halfMinDim <= 0) {
+      return;
+    }
+
     if (this.isDragging) {
       const dxPx = event.clientX - this.lastMouseX;
       const dyPx = event.clientY - this.lastMouseY;
@@ -1664,20 +1672,20 @@ export class Minimap {
       this.lastMouseX = event.clientX;
       this.lastMouseY = event.clientY;
 
-      const rect = this.canvas.getBoundingClientRect();
-      const halfMinDim = Math.min(rect.width, rect.height) * 0.5;
       const pxPerMeter = halfMinDim / this.fullZoomMeters;
-      this.panX -= dxPx / pxPerMeter;
-      this.panZ -= dyPx / pxPerMeter;
+      if (pxPerMeter > 0) {
+        this.panX -= dxPx / pxPerMeter;
+        this.panZ -= dyPx / pxPerMeter;
+      }
     }
 
-    const rect = this.canvas.getBoundingClientRect();
-    if (
+    const overCanvas =
       event.clientX >= rect.left &&
       event.clientX <= rect.right &&
       event.clientY >= rect.top &&
-      event.clientY <= rect.bottom
-    ) {
+      event.clientY <= rect.bottom;
+
+    if (overCanvas) {
       const world = this.screenToWorld(event.clientX, event.clientY);
       const nearest = this.findNearestRoadAt(world.x, world.z);
       this.hoverWorld = {
@@ -1686,11 +1694,11 @@ export class Minimap {
         y: nearest.y,
         street: nearest.street,
       };
-    } else {
+      this.render();
+    } else if (this.hoverWorld !== null || this.isDragging) {
       this.hoverWorld = null;
+      this.render();
     }
-
-    this.render();
   };
 
   private readonly handleWindowMouseUp = (): void => {
@@ -1720,6 +1728,8 @@ export class Minimap {
       event.preventDefault();
       this.setFullscreen(false);
     } else if (event.code === 'KeyC' && this.isFullscreen) {
+      event.preventDefault();
+      event.stopPropagation();
       this.panX = this.lastState.mapX;
       this.panZ = this.lastState.mapZ;
       this.render();

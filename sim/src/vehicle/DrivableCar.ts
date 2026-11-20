@@ -101,7 +101,6 @@ export class DrivableCar implements FloatingOriginListener {
   private speedLimitKmh = 50;
 
   private readonly tempMapPos = new THREE.Vector3();
-  private readonly tempRight = new THREE.Vector3();
 
   constructor(
     definition: VehicleDefinition,
@@ -285,16 +284,17 @@ export class DrivableCar implements FloatingOriginListener {
     chunkStreamer: ChunkStreamer,
     cameraYawHintRad?: number,
   ): void {
-    if (dtSeconds <= 0) {
+    if (!Number.isFinite(dtSeconds) || dtSeconds <= 0) {
       return;
     }
+    const safeDt = Math.min(dtSeconds, 0.05);
 
     if (this.onFoot) {
-      this.stepWalkingAvatar(dtSeconds, input, chunkStreamer, cameraYawHintRad);
+      this.stepWalkingAvatar(safeDt, input, chunkStreamer, cameraYawHintRad);
       // Still gently settle car if rolling when exited
       if (Math.abs(this.fwdSpeed) > 0.05) {
         this.stepVehiclePhysics(
-          dtSeconds,
+          safeDt,
           {
             throttle: false,
             brakeReverse: false,
@@ -309,7 +309,7 @@ export class DrivableCar implements FloatingOriginListener {
       return;
     }
 
-    this.stepVehiclePhysics(dtSeconds, input, chunkStreamer);
+    this.stepVehiclePhysics(safeDt, input, chunkStreamer);
   }
 
   private stepWalkingAvatar(
@@ -346,12 +346,14 @@ export class DrivableCar implements FloatingOriginListener {
     );
     const sample = chunkStreamer.sampleRoadSurface(
       mapPos.x,
-      mapPos.y + 0.3,
+      mapPos.y,
       mapPos.z,
     );
-    const targetY = sample.onRoad
-      ? sample.elevationY
-      : sample.elevationY + 0.12; // Sidewalk curb step height when off asphalt
+    const nearRoadSidewalk =
+      !sample.onRoad && Number.isFinite(sample.distanceToRoadMeters);
+    const targetY = nearRoadSidewalk
+      ? sample.elevationY + 0.12 // Sidewalk curb step height when off asphalt near a road
+      : sample.elevationY;
     this.avatarWorldPos.y += (targetY - this.avatarWorldPos.y) * Math.min(1, dtSeconds * 16);
 
     this.avatar.root.position.copy(this.avatarWorldPos);
@@ -475,8 +477,8 @@ export class DrivableCar implements FloatingOriginListener {
 
     if (this.fwdSpeed < 2.2) {
       // Smooth Ackermann steering for low speeds and all reverse maneuvers (zero reverse instability)
-      const targetYawRate =
-        (this.fwdSpeed / L) * Math.tan(this.steerAngleRad);
+      const safeSteer = THREE.MathUtils.clamp(this.steerAngleRad, -1.2, 1.2);
+      const targetYawRate = (this.fwdSpeed / L) * Math.tan(safeSteer);
       this.yawRate += (targetYawRate - this.yawRate) * Math.min(1, dtSeconds * 16);
       this.latSpeed *= Math.exp(-14 * dtSeconds);
     } else {
@@ -518,7 +520,6 @@ export class DrivableCar implements FloatingOriginListener {
     const worldVx = fx * this.fwdSpeed + rx * this.latSpeed;
     const worldVz = fz * this.fwdSpeed + rz * this.latSpeed;
 
-    this.tempRight.set(worldVx * handling.massKg, 0, worldVz * handling.massKg);
     this.rigidBody.state.velocity.set(worldVx, 0, worldVz);
     this.rigidBody.state.position.x += worldVx * dtSeconds;
     this.rigidBody.state.position.z += worldVz * dtSeconds;
@@ -536,17 +537,19 @@ export class DrivableCar implements FloatingOriginListener {
     this.onRoad = centerSurf.onRoad;
     if (centerSurf.streetName) {
       this.streetName = centerSurf.streetName;
+    } else if (!centerSurf.onRoad && centerSurf.distanceToRoadMeters > 25) {
+      this.streetName = null;
     }
     this.speedLimitKmh = centerSurf.maxspeedKmh;
 
     const frontSurf = chunkStreamer.sampleRoadSurface(
       centerMap.x + fx * (L * 0.5),
-      centerMap.y,
+      centerSurf.elevationY,
       centerMap.z + fz * (L * 0.5),
     );
     const rearSurf = chunkStreamer.sampleRoadSurface(
       centerMap.x - fx * (L * 0.5),
-      centerMap.y,
+      centerSurf.elevationY,
       centerMap.z - fz * (L * 0.5),
     );
     const targetGroundPitch = Math.atan2(

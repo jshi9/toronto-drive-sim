@@ -78,12 +78,16 @@ export const VEHICLE_CATALOG: readonly VehicleDefinition[] = [
 ];
 
 export function getVehicleDefinition(id: string): VehicleDefinition {
-  return VEHICLE_CATALOG.find((item) => item.id === id) ?? VEHICLE_CATALOG[0]!;
+  const found = VEHICLE_CATALOG.find((item) => item.id === id) ?? VEHICLE_CATALOG[0];
+  if (!found) {
+    throw new Error('VEHICLE_CATALOG is empty.');
+  }
+  return found;
 }
 
 export function getPaintColorHex(colorId: string): number {
-  return (
-    VEHICLE_PAINT_OPTIONS.find((c) => c.id === colorId)?.hex ??
-    VEHICLE_PAINT_OPTIONS[0]!.hex
-  );
+  const found =
+    VEHICLE_PAINT_OPTIONS.find((c) => c.id === colorId) ??
+    VEHICLE_PAINT_OPTIONS[0];
+  return found ? found.hex : 0xffffff;
 }

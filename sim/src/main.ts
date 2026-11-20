@@ -111,14 +111,13 @@ function bootstrap(): void {
   scene.add(groundMesh);
 
   const floatingOrigin = new FloatingOriginManager(1000);
-  let chunkStreamer: ChunkStreamer | null = null;
   const hud = new DebugHud(container, {
     onToggleRoadNames: (visible) => {
-      chunkStreamer?.setStreetNamesVisible(visible);
+      chunkStreamer.setStreetNamesVisible(visible);
     },
   });
 
-  chunkStreamer = new ChunkStreamer({
+  const chunkStreamer = new ChunkStreamer({
     floatingOrigin,
     loadRadiusMeters: 1500,
     unloadRadiusMeters: 2000,
@@ -159,7 +158,7 @@ function bootstrap(): void {
     targetMapZ: number,
     preferredDirXZ?: [number, number],
   ): void => {
-    const placement = chunkStreamer!.findNearestRoadPlacement(
+    const placement = chunkStreamer.findNearestRoadPlacement(
       targetMapX,
       targetMapY,
       targetMapZ,
@@ -175,7 +174,7 @@ function bootstrap(): void {
         placement.maxspeedKmh,
       );
     } else {
-      const surf = chunkStreamer!.sampleRoadSurface(
+      const surf = chunkStreamer.sampleRoadSurface(
         targetMapX,
         targetMapY,
         targetMapZ,
@@ -207,7 +206,7 @@ function bootstrap(): void {
     // Project a point slightly ahead of the camera onto road level
     camera.getWorldDirection(forwardScratch);
     const camHeading = Math.atan2(forwardScratch.x, -forwardScratch.z);
-    const camMap = chunkStreamer!.getMapCoordinates(camera.position, mapPosScratch);
+    const camMap = chunkStreamer.getMapCoordinates(camera.position, mapPosScratch);
     const forwardStep = THREE.MathUtils.clamp(camera.position.y * 0.35, 6, 45);
     const horizLen = Math.hypot(forwardScratch.x, forwardScratch.z) || 1;
     const dirX = forwardScratch.x / horizLen;
@@ -230,7 +229,7 @@ function bootstrap(): void {
 
     car.getFocusLocalPosition(focusPosScratch);
     floatingOrigin.update(focusPosScratch);
-    chunkStreamer!.update(focusPosScratch);
+    chunkStreamer.update(focusPosScratch);
   };
 
   const despawnVehicle = (): void => {
@@ -255,7 +254,7 @@ function bootstrap(): void {
       if (!activeCar) {
         return;
       }
-      activeCar.setOnFoot(!activeCar.isOnFoot(), chunkStreamer!);
+      activeCar.setOnFoot(!activeCar.isOnFoot(), chunkStreamer);
       if (cameraPov.getMode() === 'free_fly') {
         cameraPov.setMode('third_person');
       }
@@ -267,7 +266,7 @@ function bootstrap(): void {
       if (activeCar.isOnFoot()) {
         activeCar.setOnFoot(false);
       }
-      const carMap = chunkStreamer!.getMapCoordinates(
+      const carMap = chunkStreamer.getMapCoordinates(
         activeCar.getCarLocalPosition(focusPosScratch),
         mapPosScratch,
       );
@@ -304,7 +303,7 @@ function bootstrap(): void {
     } else if (event.code === 'KeyC' && activeCar && cameraPov.getMode() !== 'free_fly') {
       cameraPov.cycleMode();
     } else if (event.code === 'KeyF' && activeCar) {
-      activeCar.setOnFoot(!activeCar.isOnFoot(), chunkStreamer!);
+      activeCar.setOnFoot(!activeCar.isOnFoot(), chunkStreamer);
       if (cameraPov.getMode() === 'free_fly') {
         cameraPov.setMode('third_person');
       }
@@ -312,7 +311,7 @@ function bootstrap(): void {
       if (activeCar.isOnFoot()) {
         activeCar.setOnFoot(false);
       }
-      const carMap = chunkStreamer!.getMapCoordinates(
+      const carMap = chunkStreamer.getMapCoordinates(
         activeCar.getCarLocalPosition(focusPosScratch),
         mapPosScratch,
       );
@@ -395,7 +394,7 @@ function bootstrap(): void {
       vehicleHud.setVisible(!open);
       cameraPov.setInputEnabled(!open);
       if (!open) {
-        chunkStreamer!.setSecondaryMapFocus(null);
+        chunkStreamer.setSecondaryMapFocus(null);
       }
     },
     onViewStyleChange: (style) => {
@@ -415,18 +414,18 @@ function bootstrap(): void {
             mapY - 12,
             mapZ - originScratch.z,
           ),
-          -yaw,
+          yaw,
         );
         activeCar.getFocusLocalPosition(focusPosScratch);
         floatingOrigin.update(focusPosScratch);
-        chunkStreamer!.update(focusPosScratch);
+        chunkStreamer.update(focusPosScratch);
         placeCarOnNearestRoad(activeCar, mapX, mapY, mapZ, [
           -Math.sin(yaw),
           -Math.cos(yaw),
         ]);
       } else {
         floatingOrigin.update(camera.position);
-        chunkStreamer!.update(camera.position);
+        chunkStreamer.update(camera.position);
       }
     },
   });

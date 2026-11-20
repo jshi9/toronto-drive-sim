@@ -339,6 +339,9 @@ export class RoadMeshBuilder {
       color: 0x262b33,
       roughness: 0.9,
       metalness: 0.04,
+      polygonOffset: true,
+      polygonOffsetFactor: 1,
+      polygonOffsetUnits: 1,
     });
     this.terrainMaterial = new THREE.MeshStandardMaterial({
       color: 0x151c26,
@@ -4402,17 +4405,33 @@ export class RoadMeshBuilder {
       const rows = chunk.terrain_grid;
       const grid = rows.length - 1;
       for (let iz = 0; iz < grid; iz++) {
-        const row0 = rows[iz]!;
-        const row1 = rows[iz + 1]!;
+        const row0 = rows[iz];
+        const row1 = rows[iz + 1];
+        if (!row0 || !row1) {
+          continue;
+        }
         const z0 = minZ + ((maxZ - minZ) * iz) / grid - originOffset.z;
         const z1 = minZ + ((maxZ - minZ) * (iz + 1)) / grid - originOffset.z;
-        for (let ix = 0; ix < grid; ix++) {
+        const colLimit = Math.min(grid, row0.length - 1, row1.length - 1);
+        for (let ix = 0; ix < colLimit; ix++) {
+          const y00 = row0[ix];
+          const y01 = row1[ix];
+          const y11 = row1[ix + 1];
+          const y10 = row0[ix + 1];
+          if (
+            y00 === undefined ||
+            y01 === undefined ||
+            y11 === undefined ||
+            y10 === undefined
+          ) {
+            continue;
+          }
           const x0 = minX + ((maxX - minX) * ix) / grid - originOffset.x;
           const x1 = minX + ((maxX - minX) * (ix + 1)) / grid - originOffset.x;
-          const p00 = new THREE.Vector3(x0, row0[ix]! - originOffset.y, z0);
-          const p01 = new THREE.Vector3(x0, row1[ix]! - originOffset.y, z1);
-          const p11 = new THREE.Vector3(x1, row1[ix + 1]! - originOffset.y, z1);
-          const p10 = new THREE.Vector3(x1, row0[ix + 1]! - originOffset.y, z0);
+          const p00 = new THREE.Vector3(x0, y00 - originOffset.y, z0);
+          const p01 = new THREE.Vector3(x0, y01 - originOffset.y, z1);
+          const p11 = new THREE.Vector3(x1, y11 - originOffset.y, z1);
+          const p10 = new THREE.Vector3(x1, y10 - originOffset.y, z0);
           pushQuad(buf, p00, p01, p11, p10, WORLD_UP);
         }
       }

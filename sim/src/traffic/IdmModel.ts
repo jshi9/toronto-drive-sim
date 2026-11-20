@@ -34,18 +34,23 @@ export class IdmModel {
       exponent,
     } = this.params;
 
-    const freeFlowTerm = Math.pow(speedMps / desiredSpeedMps, exponent);
+    const safeDesiredSpeed = Math.max(0.1, desiredSpeedMps);
+    const safeMaxAccel = Math.max(0.01, maxAccelerationMps2);
+    const safeComfortableDecel = Math.max(0.01, comfortableDecelMps2);
+    const safeSpeed = Math.max(0, speedMps);
+
+    const freeFlowTerm = Math.pow(safeSpeed / safeDesiredSpeed, exponent);
     const desiredDynamicGap =
       minGapMeters +
       Math.max(
         0,
-        speedMps * timeHeadwaySeconds +
-          (speedMps * approachingRateMps) /
-            (2 * Math.sqrt(maxAccelerationMps2 * comfortableDecelMps2)),
+        safeSpeed * timeHeadwaySeconds +
+          (safeSpeed * approachingRateMps) /
+            (2 * Math.sqrt(safeMaxAccel * safeComfortableDecel)),
       );
     const safeGap = Math.max(0.1, netGapMeters);
     const interactionTerm = Math.pow(desiredDynamicGap / safeGap, 2);
 
-    return maxAccelerationMps2 * (1 - freeFlowTerm - interactionTerm);
+    return safeMaxAccel * (1 - freeFlowTerm - interactionTerm);
   }
 }

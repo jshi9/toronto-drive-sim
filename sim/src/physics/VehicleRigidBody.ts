@@ -28,7 +28,8 @@ export class VehicleRigidBody {
    * Advances linear and angular kinematics for a fixed timestep.
    */
   public step(dtSeconds: number, netForceWorld: THREE.Vector3): void {
-    const acceleration = netForceWorld.clone().divideScalar(this.massKg);
+    const safeMass = Math.max(1, this.massKg);
+    const acceleration = netForceWorld.clone().divideScalar(safeMass);
     this.state.velocity.addScaledVector(acceleration, dtSeconds);
     this.state.position.addScaledVector(this.state.velocity, dtSeconds);
   }

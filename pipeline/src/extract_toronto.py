@@ -372,17 +372,24 @@ def _flatten_tag_values(value: Any) -> list[str]:
     """Normalize scalar, semicolon-delimited, or list OSM tag values to strings."""
     if value is None:
         return []
-    raw_items = value if isinstance(value, (list, tuple, set)) else [value]
+    if isinstance(value, set):
+        raw_items: Any = sorted(value, key=str)
+    elif isinstance(value, (list, tuple)):
+        raw_items = value
+    else:
+        raw_items = [value]
     tokens: list[str] = []
     for item in raw_items:
         if item is None:
             continue
+        if isinstance(item, float) and math.isnan(item):
+            continue
         text = str(item).strip()
-        if not text:
+        if not text or text.lower() in {"nan", "none", "null"}:
             continue
         for part in text.split(";"):
             part_clean = part.strip()
-            if part_clean:
+            if part_clean and part_clean.lower() not in {"nan", "none", "null"}:
                 tokens.append(part_clean)
     return tokens
 
@@ -414,8 +421,10 @@ def clean_layer(value: Any) -> int:
     parsed: list[int] = []
     for token in _flatten_tag_values(value):
         try:
-            parsed.append(int(float(token)))
-        except ValueError:
+            fval = float(token)
+            if math.isfinite(fval):
+                parsed.append(int(fval))
+        except (ValueError, OverflowError):
             continue
     if not parsed:
         return 0
@@ -966,12 +975,9 @@ def clean_street_name(data: dict[str, Any]) -> str | None:
 def clean_osm_way_ids(value: Any) -> list[int]:
     """Normalize OSMnx ``osmid`` edge attribute into a list of integer way IDs."""
     ids: list[int] = []
-    raw_items = value if isinstance(value, (list, tuple, set)) else [value]
-    for item in raw_items:
-        if item is None:
-            continue
+    for token in _flatten_tag_values(value):
         try:
-            way_id = int(item)
+            way_id = int(token)
             if way_id not in ids:
                 ids.append(way_id)
         except (TypeError, ValueError):
@@ -2413,7 +2419,7 @@ def _align_and_straighten_divided_approaches(
                 ideal_outer_L = -w_t * 0.5 - 0.55
                 ideal_inner_R = ideal_outer_L + wL + 1.35
                 ideal_lat_L = ideal_outer_L + wL * 0.5
-                ideal_lat_R = ideal_inner_R + (wR * 0.5 if rpR == 0 else wR * 0.5)
+                ideal_lat_R = ideal_inner_R + wR * 0.5
                 want_L = max(0.0, min(2.2, ideal_lat_L - latL))
                 want_R = max(0.0, min(2.2, latR - ideal_lat_R))
                 wsum = want_L + want_R
@@ -3754,8 +3760,6 @@ def _build_rail_crossings_3d(
         for dx in (-1, 0, 1):
             for dz in (-1, 0, 1):
                 for rt in rail_grid.get((cx + dx, cz + dz), ()):
-                    if rt["railway_type"] != ("rail" if cn["crossing_type"] == "rail" else rt["railway_type"]):
-                        pass
                     rgeom = rt["geometry"]
                     for i in range(len(rgeom) - 1):
                         ax, _, az = rgeom[i]
@@ -3925,8 +3929,8 @@ def project_and_clean_graph(
         crossing_val = str(data.get("crossing") or "").strip().lower()
         crossing_mark = str(data.get("crossing:markings") or "").strip().lower()
         is_explicit_unmarked = crossing_val in {"unmarked", "no", "none"} or crossing_mark in {"no", "none"}
-        has_signal = raw_hw == "traffic_signals" or bool(data.get("traffic_signals"))
-        has_stop = raw_hw == "stop" or bool(data.get("stop"))
+        has_signal = raw_hw == "traffic_signals" or clean_bool_tag(data.get("traffic_signals"))
+        has_stop = raw_hw == "stop" or clean_bool_tag(data.get("stop"))
         if has_signal:
             signal_count += 1
         if has_stop:
@@ -4145,63 +4149,6 @@ def _serialize_node(
     return rec
 
 
-def _serialize_edge(u: int, v: int, key: int, data: dict[str, Any]) -> dict[str, Any]:
-    hw_str = str(data["highway_clean"])
-    lanes_tot = int(data["lanes_clean"])
-    fwd_l = int(data.get("forward_lanes", lanes_tot))
-    rev_l = int(data.get("reverse_lanes", 0))
-    both_l = int(data.get("lanes_both_ways", 0))
-    rev_c = int(data.get("lanes_reversible", 0))
-    is_ow = bool(data["oneway_clean"])
-    has_bike = bool(data.get("has_bike_lane", False))
-    b_left_t = str(data.get("bike_lane_left_type", "none"))
-    b_right_t = str(data.get("bike_lane_right_type", "none"))
-    return {
-        "id": f"{u}_{v}_{key}",
-        "u": int(u),
-        "v": int(v),
-        "key": int(key),
-        "osm_way_ids": list(data["osm_way_ids"]),
-        "name": data["name_clean"],
-        "street_name": data.get("street_name"),
-        "highway": hw_str,
-        "road_class": hw_str,
-        "lanes": lanes_tot,
-        "lanes_total": lanes_tot,
-        "lanes_forward": fwd_l,
-        "lanes_backward": rev_l,
-        "lanes_both_ways": both_l,
-        "lanes_reversible": rev_c,
-        "turn_lanes_forward": data.get("turn_lanes_fwd"),
-        "turn_lanes_backward": data.get("turn_lanes_rev"),
-        "bus_lanes_forward": data.get("bus_lanes_forward"),
-        "bus_lanes_backward": data.get("bus_lanes_backward"),
-        "hov_lanes_forward": data.get("hov_lanes_forward"),
-        "change_lanes_forward": data.get("change_lanes_forward"),
-        "placement": data.get("placement_clean"),
-        "has_streetcar_tracks": bool(data.get("has_streetcar_tracks", False)),
-        "has_bike_lane": has_bike,
-        "bike_lane_left": bool(data.get("bike_lane_left", False)),
-        "bike_lane_right": bool(data.get("bike_lane_right", False)),
-        "bike_lane_left_type": b_left_t,
-        "bike_lane_right_type": b_right_t,
-        "is_school_zone": bool(data.get("is_school_zone", False)),
-        "has_bus_bay_left": bool(data.get("has_bus_bay_left", False)),
-        "has_bus_bay_right": bool(data.get("has_bus_bay_right", False)),
-        "width_m": _edge_width_from_lanes(lanes_tot, has_bike, b_left_t, b_right_t),
-        "maxspeed_kmh": int(data["maxspeed_kmh"]),
-        "oneway": is_ow,
-        "is_oneway": is_ow,
-        "bridge": bool(data["bridge_clean"]),
-        "tunnel": bool(data["tunnel_clean"]),
-        "layer": int(data["layer"]),
-        "length_m": float(data["length_m"]),
-        "geometry": data["geometry_xyz"],
-        "turn_restrictions": list(data.get("turn_restrictions", [])),
-        "midblock_controls": list(data.get("midblock_controls", [])),
-    }
-
-
 def _subdivide_long_physical_edges_for_chunks(
     graph: nx.MultiDiGraph,
     physical_edges: list[dict[str, Any]],
@@ -4249,8 +4196,8 @@ def _subdivide_long_physical_edges_for_chunks(
         orig_u = int(edge["u"])
         orig_v = int(edge["v"])
         orig_id = str(edge["id"])
-        u_gy = float(graph.nodes[orig_u].get("ground_y", geom[0][1]))
-        v_gy = float(graph.nodes[orig_v].get("ground_y", geom[-1][1]))
+        u_gy = float(graph.nodes[orig_u].get("ground_y_m", graph.nodes[orig_u].get("ground_y", geom[0][1])))
+        v_gy = float(graph.nodes[orig_v].get("ground_y_m", graph.nodes[orig_v].get("ground_y", geom[-1][1])))
         num_pieces = len(cut_indices) - 1
 
         cut_node_ids: list[int] = [orig_u]
@@ -4318,7 +4265,8 @@ def _subdivide_long_physical_edges_for_chunks(
                             "y": round(float(pt[1]), 3),
                             "z": round(float(pt[2]), 3),
                             "ground_y": gy,
-                            "chunk_id": f"chunk_{piece_chunk[0]}_{piece_chunk[1]}",
+                            "layer": int(edge.get("layer", 0)),
+                            "owner_chunk": [int(piece_chunk[0]), int(piece_chunk[1])],
                             "in_chunk": True,
                             "traffic_signal": False,
                             "stop_sign": False,
@@ -4327,6 +4275,8 @@ def _subdivide_long_physical_edges_for_chunks(
                             "control": "none",
                             "street_count": 2,
                             "approaches": [],
+                            "turn_restrictions": [],
+                            "crosswalk_markings": [],
                         }
                     )
 
@@ -4391,7 +4341,7 @@ def _build_global_terrain_indexer(
         )
 
     for _, nd in graph.nodes(data=True):
-        gy = float(nd.get("ground_y", nd.get("y_m", 0.0)))
+        gy = float(nd.get("ground_y_m", nd.get("ground_y", nd.get("y_m", 0.0))))
         _add_pt(float(nd["x_m"]), gy, float(nd["z_m"]))
 
     for edge in physical_edges:

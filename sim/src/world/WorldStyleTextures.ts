@@ -42,12 +42,14 @@ export function createAsphaltTextureSet(): ProceduralSurfaceTextureSet {
   const albedo = document.createElement('canvas');
   albedo.width = size;
   albedo.height = size;
-  const ctx = albedo.getContext('2d')!;
-
+  const ctx = albedo.getContext('2d');
   const rough = document.createElement('canvas');
   rough.width = size;
   rough.height = size;
-  const rCtx = rough.getContext('2d')!;
+  const rCtx = rough.getContext('2d');
+  if (!ctx || !rCtx) {
+    throw new Error('Failed to acquire 2D canvas context for asphalt texture.');
+  }
 
   ctx.fillStyle = '#262b33';
   ctx.fillRect(0, 0, size, size);
@@ -118,12 +120,14 @@ export function createConcreteTextureSet(): ProceduralSurfaceTextureSet {
   const albedo = document.createElement('canvas');
   albedo.width = size;
   albedo.height = size;
-  const ctx = albedo.getContext('2d')!;
-
+  const ctx = albedo.getContext('2d');
   const rough = document.createElement('canvas');
   rough.width = size;
   rough.height = size;
-  const rCtx = rough.getContext('2d')!;
+  const rCtx = rough.getContext('2d');
+  if (!ctx || !rCtx) {
+    throw new Error('Failed to acquire 2D canvas context for asphalt texture.');
+  }
 
   ctx.fillStyle = '#aeb6bf';
   ctx.fillRect(0, 0, size, size);
@@ -180,12 +184,14 @@ export function createEarthTerrainTextureSet(
   const albedo = document.createElement('canvas');
   albedo.width = size;
   albedo.height = size;
-  const ctx = albedo.getContext('2d')!;
-
+  const ctx = albedo.getContext('2d');
   const rough = document.createElement('canvas');
   rough.width = size;
   rough.height = size;
-  const rCtx = rough.getContext('2d')!;
+  const rCtx = rough.getContext('2d');
+  if (!ctx || !rCtx) {
+    throw new Error('Failed to acquire 2D canvas context for asphalt texture.');
+  }
 
   // Warm muted urban grass/soil blend like southern Ontario satellite imagery
   ctx.fillStyle = '#3f523b';

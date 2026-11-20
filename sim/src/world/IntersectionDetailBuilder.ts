@@ -382,11 +382,12 @@ export class IntersectionDetailBuilder {
       }
 
       const centerIdx = apronTarget.positions.length / 3;
-      apronTarget.positions.push(cx, cy, cz);
+      const apronDrop = -0.004;
+      apronTarget.positions.push(cx, cy + apronDrop, cz);
       apronTarget.normals.push(0, 1, 0);
       apronTarget.uvs.push(0.5, 0.5);
       for (const p of perimeter) {
-        apronTarget.positions.push(p.x, p.y, p.z);
+        apronTarget.positions.push(p.x, p.y + apronDrop, p.z);
         apronTarget.normals.push(0, 1, 0);
         apronTarget.uvs.push(0.5, 0.5);
       }
@@ -789,7 +790,17 @@ export class IntersectionDetailBuilder {
         const v0 = innerL[0]!;
         const v1 = innerL[1]!;
         const v2 = innerR[1]!;
-        apronTarget.positions.push(v0.x, v0.y, v0.z, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z);
+        apronTarget.positions.push(
+          v0.x,
+          v0.y - 0.004,
+          v0.z,
+          v1.x,
+          v1.y - 0.004,
+          v1.z,
+          v2.x,
+          v2.y - 0.004,
+          v2.z,
+        );
         apronTarget.normals.push(0, 1, 0, 0, 1, 0, 0, 1, 0);
         apronTarget.uvs.push(0.5, 0.5, 0.5, 0.5, 0.5, 0.5);
         const wY = (v1.z - v0.z) * (v2.x - v0.x) - (v1.x - v0.x) * (v2.z - v0.z);

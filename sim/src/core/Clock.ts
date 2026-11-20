@@ -8,7 +8,7 @@ export class Clock {
   /**
    * Advances the clock and returns the clamped delta time in seconds.
    */
-  public tick(timestampMs: number, maxDeltaSeconds = 0.1): number {
+  public tick(timestampMs: number, maxDeltaSeconds = 0.05): number {
     if (this.lastTimestampMs === null) {
       this.lastTimestampMs = timestampMs;
       return 0;

@@ -578,7 +578,7 @@ class ElevationSampler:
                 for gz in range(math.floor(uz0 / grid_cell_m), math.floor(uz1 / grid_cell_m) + 1):
                     cands.update(edge_grid.get((gx, gz), ()))
 
-            for lkey in cands:
+            for lkey in sorted(cands, key=lambda k: (str(k[0]), str(k[1]), int(k[2]))):
                 lu, lv, _ = lkey
                 if lkey == ekey or ({u, v} & {lu, lv}):
                     continue
@@ -783,8 +783,6 @@ class ElevationSampler:
                     if not info["tunnel"]:
                         continue
                     max_dy = 0.070 * max(1.0, info["len"])
-                    if tunnel_floors[eu] > tunnel_floors[ev] + max_dy:
-                        pass
                     if tunnel_floors[ev] < tunnel_floors[eu] - max_dy:
                         tunnel_floors[ev] = tunnel_floors[eu] - max_dy
                         changed_t = True

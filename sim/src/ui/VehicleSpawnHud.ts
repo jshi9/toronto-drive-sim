@@ -55,7 +55,7 @@ export class VehicleSpawnHud {
   private readonly colorButtons = new Map<string, HTMLButtonElement>();
 
   private popupOpen = false;
-  private selectedColorId = VEHICLE_PAINT_OPTIONS[0]!.id;
+  private selectedColorId = VEHICLE_PAINT_OPTIONS[0]?.id ?? 'silver';
   private hasVehicle = false;
   private activePov: CameraPovMode = 'free_fly';
   private activeFov = 60;
@@ -613,5 +613,14 @@ export class VehicleSpawnHud {
         : 'rgba(148, 163, 184, 0.25)';
       btn.style.color = active ? '#e0f2fe' : '#cbd5e1';
     }
+  }
+
+  /**
+   * Removes HUD DOM elements from their parent container.
+   */
+  public dispose(): void {
+    this.dockRoot.remove();
+    this.povBarEl.remove();
+    this.gaugeEl.remove();
   }
 }
