@@ -95,6 +95,9 @@ export interface NodeApproach {
   is_freeway?: boolean;
   bridge?: boolean;
   lanes: number;
+  forward_lanes?: number;
+  reverse_lanes?: number;
+  lanes_both_ways?: number;
   width_m: number;
   edge_length_m?: number;
   oneway: boolean;
@@ -105,6 +108,9 @@ export interface NodeApproach {
   intersection_internal?: boolean;
   turn_lanes?: string[] | null;
   lane_shift_right_m?: number;
+  left_offset_m?: number;
+  right_offset_m?: number;
+  yellow_offset_right?: number;
   dir_xz: [number, number];
 }
 
@@ -216,6 +222,10 @@ export interface IntersectionGroupApproach {
   turn_lanes?: string[] | null;
   crosswalk_markings?: 'ladder' | 'lines' | 'school_ladder' | 'none' | string;
   street_name?: string | null;
+  yellow_offset_right?: number;
+  incoming_span_offset?: [number, number] | null;
+  traffic_left_offset?: number;
+  traffic_right_offset?: number;
 }
 
 export interface IntersectionGroup {
@@ -248,6 +258,7 @@ export interface MedianTransitionTrunk {
   reverse_lanes: number;
   lanes_both_ways?: number;
   u_at_split: boolean;
+  yellow_offset_right?: number;
 }
 
 export interface MedianTransitionBranch {

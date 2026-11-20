@@ -3,11 +3,13 @@ import type {
   BusBay,
   ChunkData,
   HighwayGore,
+  IntersectionGroup,
   MapEdge,
   MapNode,
   NodeApproach,
   RailCrossing,
   RailTrack,
+  TurnRestriction,
   Vec3Tuple,
 } from './MapTypes.ts';
 import {
@@ -132,6 +134,7 @@ interface EdgeTransitionPlan {
   rightPocketCoreRightM?: number;
   pinnedStartRight?: THREE.Vector3;
   pinnedEndRight?: THREE.Vector3;
+  isPlacementTransition?: boolean;
   uWidened: boolean;
   vWidened: boolean;
 }
@@ -156,6 +159,7 @@ interface TrimmedEndpointInfo {
   lanes: number;
   forwardLanes: number;
   reverseLanes: number;
+  lanesBothWays?: number;
   isControlled: boolean;
   isBidirectional: boolean;
   isIncoming: boolean;
@@ -624,7 +628,11 @@ export class RoadMeshBuilder {
     }
 
     const controlledIgEndpoints = new Set<string>();
+    const igByCornerKey = new Map<string, IntersectionGroup>();
     for (const ig of chunk.intersection_groups ?? []) {
+      for (const cn of ig.corner_nodes) {
+        igByCornerKey.set(`${cn}:${ig.layer}`, ig);
+      }
       if (!(ig.has_crosswalks || ig.signalized || ig.stop_controlled)) {
         continue;
       }
@@ -780,6 +788,7 @@ export class RoadMeshBuilder {
           lanes,
           forwardLanes: bidirectional ? reverseLanes : forwardLanes,
           reverseLanes: bidirectional ? forwardLanes : reverseLanes,
+          lanesBothWays: cs.lanesBothWays,
           isControlled,
           isBidirectional: bidirectional,
           isIncoming: bidirectional,
@@ -833,6 +842,7 @@ export class RoadMeshBuilder {
           lanes,
           forwardLanes,
           reverseLanes,
+          lanesBothWays: cs.lanesBothWays,
           isControlled,
           isBidirectional: bidirectional,
           isIncoming: true,
@@ -909,7 +919,17 @@ export class RoadMeshBuilder {
 
       // Flare exclusive right-turn pocket (+1 lane on outer right curb) gradually near the intersection
       // instead of abruptly adding two extra lanes at once back at the Y-split
-      const rightPocketCount = this.getRightPocketLanes(edge, cs);
+      const vLegalTurns = this.computeLegalTurnsForEdgeEndpoint(
+        edge,
+        true,
+        rawPoints,
+        nodeLookup,
+        igByCornerKey,
+      );
+      const uLegalTurns = bidirectional
+        ? this.computeLegalTurnsForEdgeEndpoint(edge, false, rawPoints, nodeLookup, igByCornerKey)
+        : undefined;
+      const rightPocketCount = vLegalTurns.right ? this.getRightPocketLanes(edge, cs) : 0;
       const roadPolyLen = Math.max(0, trimmedLen - startCollarM - endCollarM);
       if (
         rightPocketCount === 1 &&
@@ -1076,6 +1096,7 @@ export class RoadMeshBuilder {
             cutPt: p0.clone().addScaledVector(r0, (lOff0 + rOff0) * 0.5),
             leftPt: p0.clone().addScaledVector(r0, lOff0),
             rightPt: p0.clone().addScaledVector(r0, rOff0),
+            yellowPt: p0.clone().addScaledVector(r0, cs.yellowCenterOffsetM * scale0),
             outDir: new THREE.Vector3(t0.x, 0, t0.z).normalize(),
             isTrunk: bidirectional,
             lanes: splitLanes0,
@@ -1093,6 +1114,7 @@ export class RoadMeshBuilder {
             cutPt: pLast.clone().addScaledVector(rLast, (lOffLast + rOffLast) * 0.5),
             leftPt: pLast.clone().addScaledVector(rLast, lOffLast),
             rightPt: pLast.clone().addScaledVector(rLast, rOffLast),
+            yellowPt: pLast.clone().addScaledVector(rLast, cs.yellowCenterOffsetM * scaleLast),
             outDir: new THREE.Vector3(-tLast.x, 0, -tLast.z).normalize(),
             isTrunk: bidirectional,
             lanes,
@@ -1168,6 +1190,8 @@ export class RoadMeshBuilder {
             vHasIntersection,
             uWidened: Boolean(trans?.uWidened),
             vWidened: Boolean(trans?.vWidened),
+            vLegalTurns,
+            ...(uLegalTurns ? { uLegalTurns } : {}),
             ...(trans?.rightPocketStorageM !== undefined ? { rightPocketLimitM: trans.rightPocketStorageM } : {}),
           },
         );
@@ -1310,6 +1334,7 @@ export class RoadMeshBuilder {
           isIncoming: boolean;
           forwardLanes: number;
           reverseLanes: number;
+          lanesBothWays?: number;
           turnLanes?: string[] | null | undefined;
           crosswalkMarkings?: string;
           yellowOffsetRight?: number;
@@ -1329,6 +1354,7 @@ export class RoadMeshBuilder {
               isIncoming: trimmed.isIncoming,
               forwardLanes: trimmed.forwardLanes,
               reverseLanes: trimmed.reverseLanes,
+              ...(trimmed.lanesBothWays !== undefined ? { lanesBothWays: trimmed.lanesBothWays } : {}),
               turnLanes: trimmed.turnLanes,
               crosswalkMarkings: app.crosswalk_markings ?? plan.node.crosswalk_markings ?? 'ladder',
               ...(trimmed.yellowOffsetRight !== undefined
@@ -1340,16 +1366,33 @@ export class RoadMeshBuilder {
             const dLen = Math.hypot(app.dir_xz[0], app.dir_xz[1]) || 1;
             const outDir = new THREE.Vector2(app.dir_xz[0] / dLen, app.dir_xz[1] / dLen);
             const setback = plan.setbackByEdgeId.get(app.edge_id) ?? app.width_m * 0.5;
+            const midOff =
+              app.left_offset_m !== undefined && app.right_offset_m !== undefined
+                ? 0.5 * (app.left_offset_m + app.right_offset_m)
+                : 0;
             const cutPoint = new THREE.Vector3(
-              plan.node.x + outDir.x * setback,
+              plan.node.x + outDir.x * setback - outDir.y * midOff,
               plan.node.y,
-              plan.node.z + outDir.y * setback,
+              plan.node.z + outDir.y * setback + outDir.x * midOff,
             );
-            const halfWidth = app.width_m * 0.5;
+            const halfWidth =
+              app.left_offset_m !== undefined && app.right_offset_m !== undefined
+                ? Math.max(1.5, 0.5 * (app.right_offset_m - app.left_offset_m))
+                : app.width_m * 0.5;
             const lanes = Math.max(1, app.lanes);
             const bidirectional = Boolean(app.bidirectional);
-            const forwardLanes = bidirectional ? Math.max(1, Math.floor(lanes / 2)) : lanes;
-            const reverseLanes = bidirectional ? Math.max(1, lanes - forwardLanes) : 0;
+            const forwardLanes =
+              app.forward_lanes !== undefined
+                ? Math.max(1, app.forward_lanes)
+                : bidirectional
+                  ? Math.max(1, Math.floor(lanes / 2))
+                  : lanes;
+            const reverseLanes =
+              app.reverse_lanes !== undefined
+                ? Math.max(0, app.reverse_lanes)
+                : bidirectional
+                  ? Math.max(1, lanes - forwardLanes)
+                  : 0;
             appDetails.push({
               cutPoint,
               outDir,
@@ -1359,8 +1402,12 @@ export class RoadMeshBuilder {
               isIncoming: Boolean(app.is_incoming),
               forwardLanes,
               reverseLanes,
+              ...(app.lanes_both_ways !== undefined ? { lanesBothWays: app.lanes_both_ways } : {}),
               turnLanes: app.turn_lanes,
               crosswalkMarkings: app.crosswalk_markings ?? plan.node.crosswalk_markings ?? 'ladder',
+              ...(app.yellow_offset_right !== undefined
+                ? { yellowOffsetRight: app.yellow_offset_right }
+                : {}),
             });
             if (
               (plan.hasSignals || plan.node.stop_sign) &&
@@ -1428,12 +1475,21 @@ export class RoadMeshBuilder {
             }
           }
 
-          if (!plan.isMidblockCrossing && appDetails.length >= 3 && plan.hasSignals && plan.layer === 0) {
-            this.intersectionDetails.appendSingleNodeLeftTurnGuideArcs(
+          if (!plan.isMidblockCrossing && appDetails.length >= 3 && plan.layer === 0) {
+            if (plan.hasSignals) {
+              this.intersectionDetails.appendSingleNodeLeftTurnGuideArcs(
+                whitePaintBuffers,
+                [plan.node.x, plan.node.y, plan.node.z],
+                appDetails,
+                originOffset,
+              );
+            }
+            this.intersectionDetails.appendSingleNodeContinuityGuideLines(
               whitePaintBuffers,
               [plan.node.x, plan.node.y, plan.node.z],
               appDetails,
               originOffset,
+              { hasCrosswalks: plan.hasCrosswalk },
             );
           }
         }
@@ -1463,6 +1519,7 @@ export class RoadMeshBuilder {
         concreteSideBuffers,
         apronBuffers,
         originOffset,
+        yellowPaintBuffers,
       );
     }
 
@@ -2773,13 +2830,14 @@ export class RoadMeshBuilder {
 
     const centerExtra = lanesBothWays + lanesReversible;
     const trafficWidthM = lanesTotal * LANE_WIDTH_METERS;
+    // Anchor cross-section origin (offset = 0) at the yellow divider (or inner left yellow edge on oneway)
     const yellowFromLeftM = oneway
-      ? trafficWidthM * 0.5
+      ? 0
       : lanesTotal === 1
         ? LANE_WIDTH_METERS * 0.5
         : lanesBackward * LANE_WIDTH_METERS + (centerExtra > 0 ? LANE_WIDTH_METERS * 0.5 : 0);
 
-    let wayLineFromLeftM = yellowFromLeftM;
+    let wayLineFromLeftM = oneway ? trafficWidthM * 0.5 : yellowFromLeftM;
     const placement = typeof edge.placement === 'string' ? edge.placement.trim().toLowerCase() : null;
     if (placement) {
       const match = /^(left_of|middle_of|right_of):(\d+)$/.exec(placement);
@@ -2854,6 +2912,133 @@ export class RoadMeshBuilder {
       }
     }
     return 0;
+  }
+
+  private computeLegalTurnsForEdgeEndpoint(
+    edge: MapEdge,
+    arrivingAtV: boolean,
+    rawPoints: THREE.Vector3[],
+    nodeLookup: Map<number, MapNode>,
+    igByCornerKey: Map<string, IntersectionGroup>,
+  ): { left: boolean; through: boolean; right: boolean } {
+    const destNid = arrivingAtV ? edge.v : edge.u;
+    const destNode = nodeLookup.get(destNid);
+    if (!destNode || rawPoints.length < 2) {
+      return { left: true, through: true, right: true };
+    }
+    const pA = arrivingAtV ? rawPoints[rawPoints.length - 2]! : rawPoints[1]!;
+    const pB = arrivingAtV ? rawPoints[rawPoints.length - 1]! : rawPoints[0]!;
+    const tLen = Math.hypot(pB.x - pA.x, pB.z - pA.z) || 1;
+    const tx = (pB.x - pA.x) / tLen;
+    const tz = (pB.z - pA.z) / tLen;
+
+    const ig = igByCornerKey.get(`${destNid}:${edge.layer}`);
+    const layerApps = (destNode.approaches ?? []).filter(
+      (a) => a.layer === edge.layer && !a.intersection_internal,
+    );
+
+    // Degree-2 midblock/crosswalk splits are validated globally in the Python pipeline
+    if (!ig && layerApps.length === 2) {
+      return { left: true, through: true, right: true };
+    }
+
+    const exits: Array<{ ox: number; oz: number; eid: string }> = [];
+    if (ig) {
+      for (const app of ig.approaches) {
+        if (app.edge_id === edge.id) {
+          continue;
+        }
+        if (app.bidirectional || !app.is_incoming) {
+          exits.push({ ox: app.out_dir_xz[0], oz: app.out_dir_xz[1], eid: app.edge_id });
+        }
+      }
+    } else {
+      for (const app of layerApps) {
+        if (app.edge_id === edge.id) {
+          continue;
+        }
+        if (app.bidirectional || !app.is_incoming) {
+          exits.push({ ox: app.dir_xz[0], oz: app.dir_xz[1], eid: app.edge_id });
+        }
+      }
+    }
+
+    if (exits.length === 0) {
+      return { left: false, through: false, right: false };
+    }
+
+    const leftExits: string[] = [];
+    const thruExits: string[] = [];
+    const rightExits: string[] = [];
+    for (const ex of exits) {
+      const fwdDot = ex.ox * tx + ex.oz * tz;
+      const leftDot = ex.ox * tz - ex.oz * tx;
+      const ang = THREE.MathUtils.radToDeg(Math.atan2(leftDot, fwdDot));
+      if (ang >= 35 && ang <= 145) {
+        leftExits.push(ex.eid);
+      } else if (ang >= -145 && ang <= -35) {
+        rightExits.push(ex.eid);
+      } else if (ang > -35 && ang < 35) {
+        thruExits.push(ex.eid);
+      }
+    }
+
+    let leftOk = leftExits.length > 0;
+    let thruOk = thruExits.length > 0;
+    let rightOk = rightExits.length > 0;
+
+    const edgeWids = new Set(edge.osm_way_ids ?? []);
+    const isUnconditional = (tr: TurnRestriction): boolean => {
+      if (tr.condition || (tr.type && tr.type.includes('@'))) {
+        return false;
+      }
+      const exc = (tr.except ?? '').toLowerCase();
+      return !exc.includes('motorcar') && !exc.includes('motor_vehicle');
+    };
+
+    const relevantTrs: TurnRestriction[] = [];
+    for (const tr of edge.turn_restrictions ?? []) {
+      if ((tr.via_node === undefined || tr.via_node === destNid) && isUnconditional(tr)) {
+        relevantTrs.push(tr);
+      }
+    }
+    for (const tr of destNode.turn_restrictions ?? []) {
+      if (!isUnconditional(tr)) {
+        continue;
+      }
+      const matchesFromId =
+        tr.from_edge_ids?.includes(edge.id) ||
+        (edge.reverse_edge_id ? tr.from_edge_ids?.includes(edge.reverse_edge_id) : false);
+      const matchesFromWay = (tr.from_way_ids ?? []).some((w) => edgeWids.has(w));
+      if (matchesFromId || matchesFromWay) {
+        relevantTrs.push(tr);
+      }
+    }
+
+    for (const tr of relevantTrs) {
+      const rtype = (tr.type ?? '').trim().toLowerCase();
+      const toSet = new Set(tr.to_edge_ids ?? []);
+      if (rtype === 'no_left_turn') {
+        if (leftExits.every((eid) => toSet.has(eid))) {
+          leftOk = false;
+        }
+      } else if (rtype === 'no_right_turn') {
+        if (rightExits.every((eid) => toSet.has(eid))) {
+          rightOk = false;
+        }
+      } else if (rtype === 'only_straight_on') {
+        leftOk = false;
+        rightOk = false;
+      } else if (rtype === 'only_left_turn') {
+        thruOk = false;
+        rightOk = false;
+      } else if (rtype === 'only_right_turn') {
+        thruOk = false;
+        leftOk = false;
+      }
+    }
+
+    return { left: leftOk, through: thruOk, right: rightOk };
   }
 
   private computeEdgeTransitionPlans(
@@ -2985,16 +3170,20 @@ export class RoadMeshBuilder {
           } else {
             planA.pinnedEndRight = sharedAxis.clone();
           }
-          const otherShiftRaw = otherApp.lane_shift_right_m ?? 0;
-          const otherFwdRight =
-            otherApp.oneway && otherApp.is_incoming
-              ? new THREE.Vector3(otherApp.dir_xz[1], 0, -otherApp.dir_xz[0])
-              : new THREE.Vector3(-otherApp.dir_xz[1], 0, otherApp.dir_xz[0]);
-          const otherSameDir = otherFwdRight.dot(a.fwdRight) >= 0;
-          const otherShift = otherShiftRaw * (otherSameDir ? 1 : -1);
-          const otherHalf = Math.max(1.75, otherApp.width_m * 0.5);
-          const otherLeft = -otherHalf + otherShift;
-          const otherRight = otherHalf + otherShift;
+          const otherCandRight = new THREE.Vector3(-otherApp.dir_xz[1], 0, otherApp.dir_xz[0]);
+          const otherSameDir = otherCandRight.dot(a.fwdRight) >= 0;
+          let otherLeft: number;
+          let otherRight: number;
+          if (otherApp.left_offset_m !== undefined && otherApp.right_offset_m !== undefined) {
+            otherLeft = otherSameDir ? otherApp.left_offset_m : -otherApp.right_offset_m;
+            otherRight = otherSameDir ? otherApp.right_offset_m : -otherApp.left_offset_m;
+          } else {
+            const otherShiftRaw = otherApp.lane_shift_right_m ?? 0;
+            const otherShift = otherShiftRaw * (otherSameDir ? 1 : -1);
+            const otherHalf = Math.max(1.75, otherApp.width_m * 0.5);
+            otherLeft = -otherHalf + otherShift;
+            otherRight = otherHalf + otherShift;
+          }
           const aWider =
             a.cs.lanesTotal > otherApp.lanes ||
             (a.cs.lanesTotal === otherApp.lanes && a.cs.widthMeters > otherApp.width_m + 0.08);
@@ -3186,6 +3375,69 @@ export class RoadMeshBuilder {
           assignTaper(a, midLeftInA, midRightInA, trimmedA * 0.78, false);
           assignTaper(b, midLeftInB, midRightInB, trimmedB * 0.78, false);
         }
+      }
+    }
+
+    // Support OSM placement=transition edges by interpolating cross-sections cleanly between u and v neighbors
+    for (const edge of chunk.edges) {
+      if (excludedEdgeIds?.has(edge.id) || edge.intersection_internal) {
+        continue;
+      }
+      const cs = profiles.get(edge.id);
+      const plan = transitions.get(edge.id);
+      if (!cs || !plan || cs.placement !== 'transition') {
+        continue;
+      }
+      const resolveNeighborOffsets = (
+        nid: number,
+        isStartEnd: boolean,
+      ): { left: number; right: number } | null => {
+        const key = `${nid}:${edge.layer}`;
+        const localEnds = byNodeLayer.get(key) ?? [];
+        const selfRec = localEnds.find((r) => r.edge.id === edge.id && r.isStart === isStartEnd);
+        if (!selfRec) {
+          return null;
+        }
+        const otherLocal = localEnds.find(
+          (r) =>
+            r.edge.id !== edge.id &&
+            r.outDirX * selfRec.outDirX + r.outDirZ * selfRec.outDirZ < -0.5,
+        );
+        if (otherLocal) {
+          const sameSide = selfRec.fwdRight.dot(otherLocal.fwdRight) >= 0;
+          return {
+            left: sameSide ? otherLocal.cs.leftOffsetM : -otherLocal.cs.rightOffsetM,
+            right: sameSide ? otherLocal.cs.rightOffsetM : -otherLocal.cs.leftOffsetM,
+          };
+        }
+        const node = nodeById.get(nid);
+        const otherApp = (node?.approaches ?? []).find(
+          (app) =>
+            app.layer === edge.layer &&
+            !app.intersection_internal &&
+            app.edge_id !== edge.id &&
+            app.dir_xz[0] * selfRec.outDirX + app.dir_xz[1] * selfRec.outDirZ < -0.5,
+        );
+        if (otherApp && otherApp.left_offset_m !== undefined && otherApp.right_offset_m !== undefined) {
+          const candR = new THREE.Vector3(-otherApp.dir_xz[1], 0, otherApp.dir_xz[0]);
+          const sameSide = candR.dot(selfRec.fwdRight) >= 0;
+          return {
+            left: sameSide ? otherApp.left_offset_m : -otherApp.right_offset_m,
+            right: sameSide ? otherApp.right_offset_m : -otherApp.left_offset_m,
+          };
+        }
+        return null;
+      };
+
+      const uOff = resolveNeighborOffsets(edge.u, true);
+      const vOff = resolveNeighborOffsets(edge.v, false);
+      if (uOff || vOff) {
+        plan.startLeftM = uOff ? uOff.left : cs.leftOffsetM;
+        plan.startRightM = uOff ? uOff.right : cs.rightOffsetM;
+        plan.endLeftM = vOff ? vOff.left : cs.leftOffsetM;
+        plan.endRightM = vOff ? vOff.right : cs.rightOffsetM;
+        plan.isPlacementTransition = true;
+        plan.startTaperLenM = Math.max(1.0, edge.length_m || 12.0);
       }
     }
 
@@ -3395,12 +3647,19 @@ export class RoadMeshBuilder {
         const setback = setbackByEdgeId.get(app.edge_id) ?? app.width_m * 0.5;
         outDirX = app.dir_xz[0];
         outDirZ = app.dir_xz[1];
+        const midOff =
+          app.left_offset_m !== undefined && app.right_offset_m !== undefined
+            ? 0.5 * (app.left_offset_m + app.right_offset_m)
+            : 0;
         cutPoint = new THREE.Vector3(
-          node.x + outDirX * setback,
+          node.x + outDirX * setback - outDirZ * midOff,
           node.y,
-          node.z + outDirZ * setback,
+          node.z + outDirZ * setback + outDirX * midOff,
         );
-        halfWidth = app.width_m * 0.5;
+        halfWidth =
+          app.left_offset_m !== undefined && app.right_offset_m !== undefined
+            ? Math.max(1.5, 0.5 * (app.right_offset_m - app.left_offset_m))
+            : app.width_m * 0.5;
       }
 
       // right_out = outwardDir × WORLD_UP = (-outDirZ, 0, outDirX)
@@ -4134,6 +4393,28 @@ export class RoadMeshBuilder {
     const startTaper = trans?.startTaperLenM ?? 0;
     const startLeadIn = trans?.startLeadInM ?? 0;
     const endTaper = trans?.endTaperLenM ?? 0;
+    if (trans?.isPlacementTransition) {
+      this.appendTaperSegment(
+        roadTarget,
+        apronTarget,
+        whiteEdgeTarget,
+        yellowEdgeTarget,
+        points,
+        trans.startLeftM,
+        trans.startRightM,
+        trans.endLeftM,
+        trans.endRightM,
+        cs.leftOffsetM,
+        cs.rightOffsetM,
+        cs.oneway,
+        allowBank,
+        originOffset,
+        trans.pinnedStartRight,
+        trans.pinnedEndRight,
+        extraVOffsetM,
+      );
+      return;
+    }
     if (startTaper <= 0.15 && startLeadIn <= 0.15 && endTaper <= 0.15) {
       const buf = this.createRibbonBuffersWithOffsets(
         points,

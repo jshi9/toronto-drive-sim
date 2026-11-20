@@ -567,18 +567,55 @@ def clean_lanes(data: dict[str, Any], highway: str, oneway: bool) -> int:
     return total
 
 
-def clean_placement(data: dict[str, Any], oneway: bool) -> str | None:
-    """Normalize OSM ``placement`` / ``placement:forward`` / ``placement:backward`` tag."""
-    candidates = (
-        [data.get("placement:forward"), data.get("placement")]
-        if oneway
-        else [data.get("placement"), data.get("placement:forward"), data.get("placement:backward")]
-    )
-    for raw in candidates:
+def clean_placement(
+    data: dict[str, Any],
+    oneway: bool,
+    fwd_lanes: int = 1,
+    rev_lanes: int = 0,
+    center_extra: int = 0,
+) -> str | None:
+    """Normalize OSM ``placement`` / ``placement:forward`` / ``placement:backward`` tag to global lane index."""
+    total_lanes = max(1, fwd_lanes if oneway else (fwd_lanes + rev_lanes + center_extra))
+
+    def _parse_tokens(raw: Any) -> str | None:
         for tok in _flatten_tag_values(raw):
             norm = tok.strip().lower()
-            if norm in {"transition"} or re.fullmatch(r"(left_of|middle_of|right_of):\d+", norm):
+            if norm == "transition":
                 return norm
+            if re.fullmatch(r"(left_of|middle_of|right_of):\d+", norm):
+                return norm
+        return None
+
+    bare = _parse_tokens(data.get("placement"))
+    if bare == "transition":
+        return "transition"
+    if bare is not None:
+        mode, idx_s = bare.split(":", 1)
+        idx = max(1, min(total_lanes, int(idx_s)))
+        return f"{mode}:{idx}"
+
+    fwd_tok = _parse_tokens(data.get("placement:forward"))
+    if fwd_tok == "transition":
+        return "transition"
+    if fwd_tok is not None:
+        mode, idx_s = fwd_tok.split(":", 1)
+        local_idx = max(1, min(max(1, fwd_lanes), int(idx_s)))
+        if oneway:
+            return f"{mode}:{local_idx}"
+        global_idx = rev_lanes + center_extra + local_idx
+        return f"{mode}:{max(1, min(total_lanes, global_idx))}"
+
+    if not oneway and rev_lanes > 0:
+        rev_tok = _parse_tokens(data.get("placement:backward"))
+        if rev_tok == "transition":
+            return "transition"
+        if rev_tok is not None:
+            mode, idx_s = rev_tok.split(":", 1)
+            local_idx = max(1, min(rev_lanes, int(idx_s)))
+            global_idx = rev_lanes - local_idx + 1
+            swapped_mode = "right_of" if mode == "left_of" else ("left_of" if mode == "right_of" else mode)
+            return f"{swapped_mode}:{max(1, min(total_lanes, global_idx))}"
+
     return None
 
 
@@ -1312,7 +1349,13 @@ def detect_divided_oneways(graph: nx.MultiDiGraph) -> int:
             data["bike_lane_right"] = b_right
             data["bike_lane_left_type"] = b_left_t
             data["bike_lane_right_type"] = b_right_t
-            data["placement_clean"] = clean_placement(data, oneway=True)
+            data["placement_clean"] = clean_placement(
+                data,
+                oneway=True,
+                fwd_lanes=fwd,
+                rev_lanes=rev,
+                center_extra=both + rev_center,
+            )
             bus_fwd, bus_rev, hov_fwd, chg_fwd = parse_bus_and_hov_lanes(data, oneway=True, fwd_lanes=fwd, rev_lanes=rev)
             data["bus_lanes_forward"] = bus_fwd
             data["bus_lanes_backward"] = bus_rev
@@ -1390,6 +1433,90 @@ def _edge_width_from_lanes(
     if extra_bike == 0.0 and has_bike_lane:
         extra_bike = 1.6
     return round(int(lanes_total) * 3.5 + extra_bike, 3)
+
+
+def _resolve_edge_cross_section_offsets(
+    edge: dict[str, Any],
+) -> tuple[float, float, float, float, float]:
+    """Return ``(left_off, right_off, traffic_left_off, traffic_right_off, yellow_off)`` along edge forward right."""
+    lane_w = 3.5
+    bike_w = 1.6
+    oneway = bool(edge.get("is_oneway") if edge.get("is_oneway") is not None else edge.get("oneway"))
+    lanes_total = max(1, int(edge.get("lanes_total", edge["lanes"])))
+    if oneway:
+        fwd = lanes_total
+        rev = 0
+        center_extra = 0
+    else:
+        both_w = 1 if int(edge.get("lanes_both_ways", 0) or 0) > 0 else 0
+        rev_c = 1 if (both_w == 0 and int(edge.get("lanes_reversible", 0) or 0) > 0) else 0
+        center_extra = both_w + rev_c
+        if lanes_total == 1:
+            fwd = 1
+            rev = 1
+            center_extra = 0
+        else:
+            exp_fwd = edge.get("lanes_forward", edge.get("forward_lanes"))
+            exp_rev = edge.get("lanes_backward", edge.get("reverse_lanes"))
+            if exp_fwd is not None and exp_rev is not None:
+                fwd = max(1, int(exp_fwd))
+                rev = max(1, int(exp_rev))
+            elif exp_fwd is not None:
+                fwd = max(1, int(exp_fwd))
+                rev = max(1, lanes_total - center_extra - fwd)
+            elif exp_rev is not None:
+                rev = max(1, int(exp_rev))
+                fwd = max(1, lanes_total - center_extra - rev)
+            else:
+                avail = max(2, lanes_total - center_extra)
+                rev = max(1, avail // 2)
+                fwd = max(1, avail - rev)
+            lanes_total = rev + center_extra + fwd
+
+    def _norm_bike(raw: Any, legacy: Any) -> str:
+        s = str(raw or "").strip().lower()
+        if s in {"shared", "lane", "track"}:
+            return s
+        return "lane" if legacy else "none"
+
+    b_left_t = _norm_bike(edge.get("bike_lane_left_type"), edge.get("bike_lane_left"))
+    b_right_t = _norm_bike(edge.get("bike_lane_right_type"), edge.get("bike_lane_right"))
+    if b_left_t == "none" and b_right_t == "none" and edge.get("has_bike_lane"):
+        b_right_t = "lane"
+    bike_left_m = bike_w if b_left_t in {"lane", "track"} else 0.0
+    bike_right_m = bike_w if b_right_t in {"lane", "track"} else 0.0
+
+    traffic_w = lanes_total * lane_w
+    if oneway:
+        yellow_from_left = 0.0
+        way_from_left = traffic_w * 0.5
+    elif lanes_total == 1:
+        yellow_from_left = lane_w * 0.5
+        way_from_left = yellow_from_left
+    else:
+        yellow_from_left = rev * lane_w + (lane_w * 0.5 if center_extra > 0 else 0.0)
+        way_from_left = yellow_from_left
+
+    placement = str(edge.get("placement") or "").strip().lower()
+    if placement:
+        pl_m = re.fullmatch(r"(left_of|middle_of|right_of):(\d+)", placement)
+        if pl_m:
+            mode = pl_m.group(1)
+            lane_idx = max(1, min(lanes_total, int(pl_m.group(2))))
+            if mode == "left_of":
+                way_from_left = (lane_idx - 1) * lane_w
+            elif mode == "middle_of":
+                way_from_left = (lane_idx - 0.5) * lane_w
+            else:
+                way_from_left = lane_idx * lane_w
+
+    shift_r = float(edge.get("lane_shift_right_m", 0.0) or 0.0)
+    traffic_left_off = -way_from_left + shift_r
+    traffic_right_off = traffic_w - way_from_left + shift_r
+    left_off = traffic_left_off - bike_left_m
+    right_off = traffic_right_off + bike_right_m
+    yellow_off = traffic_left_off + yellow_from_left
+    return left_off, right_off, traffic_left_off, traffic_right_off, yellow_off
 
 
 def _normalize_corridor_lane_consistency(physical_edges: list[dict[str, Any]]) -> None:
@@ -1650,6 +1777,17 @@ def collapse_bidirectional_edges(
                 b_right_t = str(rev_data.get("bike_lane_left_type", "none"))
             has_streetcar = bool(data.get("has_streetcar_tracks") or rev_data.get("has_streetcar_tracks"))
             placement = data.get("placement_clean")
+            if placement is None:
+                rev_pl = rev_data.get("placement_clean")
+                if rev_pl == "transition":
+                    placement = "transition"
+                elif isinstance(rev_pl, str):
+                    pl_m = re.fullmatch(r"(left_of|middle_of|right_of):(\d+)", rev_pl)
+                    if pl_m:
+                        rmode, ridx = pl_m.group(1), int(pl_m.group(2))
+                        flipped_idx = max(1, min(total_lanes, total_lanes - ridx + 1))
+                        flipped_mode = "right_of" if rmode == "left_of" else ("left_of" if rmode == "right_of" else rmode)
+                        placement = f"{flipped_mode}:{flipped_idx}"
             bus_fwd = data.get("bus_lanes_forward")
             bus_rev = data.get("bus_lanes_backward") or rev_data.get("bus_lanes_forward")
             hov_fwd = data.get("hov_lanes_forward")
@@ -1707,7 +1845,7 @@ def collapse_bidirectional_edges(
                 "layer": int(data["layer"]),
                 "length_m": float(data["length_m"]),
                 "geometry": data["geometry_xyz"],
-                "turn_restrictions": list(data.get("turn_restrictions", [])),
+                "turn_restrictions": list(data.get("turn_restrictions", [])) + list(rev_data.get("turn_restrictions", [])),
                 "midblock_controls": list(data.get("midblock_controls", [])),
                 "_bare_odd_untagged": bool(data.get("_bare_odd_untagged", False)),
             }
@@ -1881,9 +2019,25 @@ def collapse_bidirectional_edges(
 
     _normalize_corridor_lane_consistency(physical_edges)
     twin_pairs = _normalize_divided_widths_and_lanes(physical_edges)
+    sup_f1, sup_r1 = _validate_turn_lanes(graph, physical_edges, intersection_groups=None)
     _align_divided_left_turn_lanes(graph, physical_edges, twin_pairs)
     _align_and_straighten_divided_approaches(graph, physical_edges, tram_grid=tram_grid)
     intersection_groups, median_transitions = _build_intersection_topology(graph, physical_edges)
+    sup_f2, sup_r2 = _validate_turn_lanes(graph, physical_edges, intersection_groups=intersection_groups)
+    edge_lookup_val = {str(e["id"]): e for e in physical_edges}
+    for ig in intersection_groups:
+        for app in ig.get("approaches", []):
+            e_obj = edge_lookup_val.get(str(app["edge_id"]))
+            if e_obj is not None:
+                bidir_e = bool(e_obj.get("bidirectional"))
+                is_at_u = int(e_obj["u"]) == int(app["corner_node"])
+                app["turn_lanes"] = (e_obj.get("turn_lanes_rev") if bidir_e else None) if is_at_u else e_obj.get("turn_lanes_fwd")
+    if (sup_f1 + sup_r1 + sup_f2 + sup_r2) > 0:
+        logger.info(
+            "Validated turn:lanes against topology/restrictions: adjusted %d forward and %d reverse turn arrays.",
+            sup_f1 + sup_f2,
+            sup_r1 + sup_r2,
+        )
     highway_gores = _extract_highway_gores(graph, physical_edges)
 
     node_approaches: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -1911,6 +2065,11 @@ def collapse_bidirectional_edges(
             if v_mark == "ladder":
                 v_mark = "school_ladder"
 
+        left_off, right_off, _, _, yellow_off = _resolve_edge_cross_section_offsets(edge)
+        fwd_l_app = int(edge.get("lanes_forward", edge.get("forward_lanes", edge["lanes"])))
+        rev_l_app = int(edge.get("lanes_backward", edge.get("reverse_lanes", 0)))
+        both_l_app = int(edge.get("lanes_both_ways", 0) or 0)
+
         app_u: dict[str, Any] = {
             "edge_id": edge["id"],
             "other_node": v,
@@ -1919,6 +2078,9 @@ def collapse_bidirectional_edges(
             "is_freeway": is_freeway,
             "bridge": is_bridge,
             "lanes": int(edge["lanes"]),
+            "forward_lanes": rev_l_app if bidir else fwd_l_app,
+            "reverse_lanes": fwd_l_app if bidir else rev_l_app,
+            "lanes_both_ways": both_l_app,
             "width_m": width_m,
             "edge_length_m": float(edge["length_m"]),
             "oneway": oneway,
@@ -1928,6 +2090,9 @@ def collapse_bidirectional_edges(
             "crosswalk_markings": u_mark,
             "intersection_internal": bool(edge.get("intersection_internal", False)),
             "turn_lanes": edge.get("turn_lanes_rev") if bidir else None,
+            "left_offset_m": round(left_off, 3),
+            "right_offset_m": round(right_off, 3),
+            "yellow_offset_right": round(yellow_off - 0.5 * (left_off + right_off), 3),
             "dir_xz": _outgoing_dir_xz(geom, from_start=True),
         }
         shift_r = float(edge.get("lane_shift_right_m", 0.0) or 0.0)
@@ -1943,6 +2108,9 @@ def collapse_bidirectional_edges(
                 "is_freeway": is_freeway,
                 "bridge": is_bridge,
                 "lanes": int(edge["lanes"]),
+                "forward_lanes": fwd_l_app,
+                "reverse_lanes": rev_l_app,
+                "lanes_both_ways": both_l_app,
                 "width_m": width_m,
                 "edge_length_m": float(edge["length_m"]),
                 "oneway": oneway,
@@ -1952,6 +2120,9 @@ def collapse_bidirectional_edges(
                 "crosswalk_markings": v_mark,
                 "intersection_internal": bool(edge.get("intersection_internal", False)),
                 "turn_lanes": edge.get("turn_lanes_fwd"),
+                "left_offset_m": round(-right_off, 3),
+                "right_offset_m": round(-left_off, 3),
+                "yellow_offset_right": round(-(yellow_off - 0.5 * (left_off + right_off)), 3),
                 "dir_xz": _outgoing_dir_xz(geom, from_start=False),
             }
             if abs(shift_r) > 1e-3:
@@ -1959,7 +2130,13 @@ def collapse_bidirectional_edges(
             node_approaches[v].append(app_v)
 
     edge_map = {e["id"]: e for e in physical_edges}
-    median_islands = _build_median_islands(edge_map, twin_pairs, tram_grid=tram_grid)
+    median_islands = _build_median_islands(
+        edge_map,
+        twin_pairs,
+        node_approaches=node_approaches,
+        graph=graph,
+        tram_grid=tram_grid,
+    )
     for edge in physical_edges:
         edge.pop("_left_bay_prev_inner_m", None)
     return (
@@ -1971,6 +2148,306 @@ def collapse_bidirectional_edges(
         median_transitions,
         highway_gores,
     )
+
+
+def _validate_turn_lanes(
+    graph: nx.MultiDiGraph,
+    physical_edges: list[dict[str, Any]],
+    intersection_groups: list[dict[str, Any]] | None = None,
+) -> tuple[int, int]:
+    """Cross-check turn:lanes against legal outgoing edges and unconditional turn restrictions."""
+    inc_by_nl: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+    edge_by_id: dict[str, dict[str, Any]] = {}
+    for e in physical_edges:
+        edge_by_id[str(e["id"])] = e
+        if e.get("intersection_internal"):
+            continue
+        u, v, lay = int(e["u"]), int(e["v"]), int(e["layer"])
+        inc_by_nl[(u, lay)].append(e)
+        if u != v:
+            inc_by_nl[(v, lay)].append(e)
+
+    ig_by_corner: dict[tuple[int, int], dict[str, Any]] = {}
+    if intersection_groups:
+        for ig in intersection_groups:
+            ig_lay = int(ig["layer"])
+            for cn in ig.get("corner_nodes", []):
+                ig_by_corner[(int(cn), ig_lay)] = ig
+
+    def _can_exit_on(oe: dict[str, Any], from_nid: int) -> bool:
+        return int(oe["u"]) == from_nid or (bool(oe.get("bidirectional")) and int(oe["v"]) == from_nid)
+
+    def _edge_travel_dir(edge: dict[str, Any], arriving_at_v: bool) -> tuple[float, float]:
+        geom = edge.get("geometry") or []
+        if len(geom) < 2:
+            return (1.0, 0.0)
+        if arriving_at_v:
+            dx = float(geom[-1][0]) - float(geom[-2][0])
+            dz = float(geom[-1][2]) - float(geom[-2][2])
+        else:
+            dx = float(geom[0][0]) - float(geom[1][0])
+            dz = float(geom[0][2]) - float(geom[1][2])
+        n = math.hypot(dx, dz)
+        return (dx / n, dz / n) if n > 1e-5 else (1.0, 0.0)
+
+    def _collect_dest_context(
+        edge: dict[str, Any],
+        arriving_at_v: bool,
+    ) -> tuple[int, tuple[float, float], list[tuple[tuple[float, float], str, set[int]]], dict[str, Any] | None, dict[str, Any]]:
+        lay = int(edge["layer"])
+        cur_edge = edge
+        cur_nid = int(edge["v"]) if arriving_at_v else int(edge["u"])
+        cur_dir = _edge_travel_dir(edge, arriving_at_v)
+        visited: set[int] = {int(edge["u"]) if arriving_at_v else int(edge["v"]), cur_nid}
+        walked_m = 0.0
+
+        for _ in range(6):
+            if (cur_nid, lay) in ig_by_corner:
+                break
+            inc = inc_by_nl.get((cur_nid, lay), [])
+            if len(inc) != 2:
+                break
+            other = inc[1] if inc[0]["id"] == cur_edge["id"] else inc[0]
+            if not _can_exit_on(other, cur_nid):
+                break
+            nxt_from_start = int(other["u"]) == cur_nid
+            out_d = _outgoing_dir_xz(other["geometry"], from_start=nxt_from_start)
+            if out_d[0] * cur_dir[0] + out_d[1] * cur_dir[1] < 0.80:
+                break
+            step_len = float(other.get("length_m", 0.0) or 0.0)
+            if walked_m + step_len > 150.0:
+                break
+            nxt_nid = int(other["v"]) if nxt_from_start else int(other["u"])
+            if nxt_nid in visited:
+                break
+            visited.add(nxt_nid)
+            walked_m += step_len
+            cur_edge = other
+            cur_nid = nxt_nid
+            cur_dir = _edge_travel_dir(other, arriving_at_v=nxt_from_start)
+
+        ig = ig_by_corner.get((cur_nid, lay))
+        exits: list[tuple[tuple[float, float], str, set[int]]] = []
+        if ig is not None:
+            for app in ig.get("approaches", []):
+                eid = str(app["edge_id"])
+                if eid == str(cur_edge["id"]):
+                    continue
+                if bool(app.get("bidirectional")) or not bool(app.get("is_incoming")):
+                    ox, oz = float(app["out_dir_xz"][0]), float(app["out_dir_xz"][1])
+                    oe = edge_by_id.get(eid)
+                    wids = {int(w) for w in (oe.get("osm_way_ids", []) if oe else [])}
+                    exits.append(((ox, oz), eid, wids))
+        else:
+            seen_eids: set[str] = {str(cur_edge["id"])}
+            box_nodes: list[int] = [cur_nid]
+            # Pre-topology pass: peek across short <=34m divided-intersection link edges
+            if intersection_groups is None and len(inc_by_nl.get((cur_nid, lay), [])) >= 3:
+                for oe in inc_by_nl[(cur_nid, lay)]:
+                    if oe["id"] == cur_edge["id"] or float(oe.get("length_m", 999.0)) > 34.0:
+                        continue
+                    far_n = int(oe["v"]) if int(oe["u"]) == cur_nid else int(oe["u"])
+                    if len(inc_by_nl.get((far_n, lay), [])) >= 3 and far_n not in box_nodes:
+                        box_nodes.append(far_n)
+            for bn in box_nodes:
+                for oe in inc_by_nl.get((bn, lay), []):
+                    eid = str(oe["id"])
+                    if eid in seen_eids:
+                        continue
+                    if not _can_exit_on(oe, bn):
+                        continue
+                    # Do not count a short cross-box connector itself as a street turn exit unless no other exists
+                    if bn != cur_nid and float(oe.get("length_m", 999.0)) <= 34.0:
+                        continue
+                    seen_eids.add(eid)
+                    ox, oz = _outgoing_dir_xz(oe["geometry"], from_start=(int(oe["u"]) == bn))
+                    wids = {int(w) for w in oe.get("osm_way_ids", [])}
+                    exits.append(((ox, oz), eid, wids))
+
+        return cur_nid, cur_dir, exits, ig, cur_edge
+
+    def _is_unconditional(tr: dict[str, Any]) -> bool:
+        if tr.get("condition") or "@" in str(tr.get("type") or ""):
+            return False
+        exc = str(tr.get("except") or "").lower()
+        if "motorcar" in exc or "motor_vehicle" in exc:
+            return False
+        return True
+
+    def _legal_dirs_for_slot(
+        edge: dict[str, Any],
+        arriving_at_v: bool,
+    ) -> tuple[bool, bool, bool, bool, bool]:
+        dest_nid, (tx, tz), exits, ig, terminal_edge = _collect_dest_context(edge, arriving_at_v)
+        if not exits:
+            return False, False, False, False, False
+
+        left_exits: list[tuple[str, set[int]]] = []
+        slight_left_exits: list[tuple[str, set[int]]] = []
+        thru_exits: list[tuple[str, set[int]]] = []
+        slight_right_exits: list[tuple[str, set[int]]] = []
+        right_exits: list[tuple[str, set[int]]] = []
+
+        for (ox, oz), eid, wids in exits:
+            fwd_dot = ox * tx + oz * tz
+            left_dot = ox * tz - oz * tx
+            ang = math.degrees(math.atan2(left_dot, fwd_dot))
+            if 35.0 <= ang <= 145.0:
+                left_exits.append((eid, wids))
+                slight_left_exits.append((eid, wids))
+            elif 10.0 <= ang < 35.0:
+                slight_left_exits.append((eid, wids))
+                thru_exits.append((eid, wids))
+            elif -35.0 < ang <= -10.0:
+                slight_right_exits.append((eid, wids))
+                thru_exits.append((eid, wids))
+            elif -10.0 < ang < 10.0:
+                thru_exits.append((eid, wids))
+            elif -145.0 <= ang <= -35.0:
+                right_exits.append((eid, wids))
+                slight_right_exits.append((eid, wids))
+
+        left_ok = len(left_exits) > 0
+        slight_left_ok = len(slight_left_exits) > 0
+        thru_ok = len(thru_exits) > 0
+        slight_right_ok = len(slight_right_exits) > 0
+        right_ok = len(right_exits) > 0
+
+        # Apply unconditional OSM turn restrictions at terminal_edge / dest_nid / ig corners
+        term_wids = {int(w) for w in terminal_edge.get("osm_way_ids", [])}
+        relevant_trs: list[dict[str, Any]] = []
+        for tr in terminal_edge.get("turn_restrictions", []):
+            if int(tr.get("via_node", -1)) == dest_nid and _is_unconditional(tr):
+                relevant_trs.append(tr)
+        node_check_ids = list(ig.get("corner_nodes", [dest_nid])) if ig is not None else [dest_nid]
+        for nid in node_check_ids:
+            if nid not in graph.nodes:
+                continue
+            for tr in graph.nodes[nid].get("turn_restrictions", []):
+                if not _is_unconditional(tr):
+                    continue
+                from_eids = set(str(x) for x in (tr.get("from_edge_ids") or []))
+                from_wids = {int(w) for w in (tr.get("from_way_ids") or [])}
+                if (
+                    str(terminal_edge["id"]) in from_eids
+                    or str(terminal_edge.get("reverse_edge_id") or "") in from_eids
+                    or bool(term_wids & from_wids)
+                ):
+                    relevant_trs.append(tr)
+
+        for tr in relevant_trs:
+            rtype = str(tr.get("type") or "").strip().lower()
+            to_eids = set(str(x) for x in (tr.get("to_edge_ids") or []))
+            to_wids = {int(w) for w in (tr.get("to_way_ids") or [])}
+
+            def _matches_exit(eid: str, wids: set[int]) -> bool:
+                e_obj = edge_by_id.get(eid)
+                rev_id = str(e_obj.get("reverse_edge_id") or "") if e_obj else ""
+                return (eid in to_eids) or (bool(rev_id) and rev_id in to_eids) or bool(wids & to_wids)
+
+            if rtype == "no_left_turn":
+                if not any(not _matches_exit(eid, wids) for eid, wids in left_exits):
+                    left_ok = False
+                if not any(not _matches_exit(eid, wids) for eid, wids in slight_left_exits):
+                    slight_left_ok = False
+            elif rtype == "no_right_turn":
+                if not any(not _matches_exit(eid, wids) for eid, wids in right_exits):
+                    right_ok = False
+                if not any(not _matches_exit(eid, wids) for eid, wids in slight_right_exits):
+                    slight_right_ok = False
+            elif rtype == "only_straight_on":
+                left_ok = False
+                slight_left_ok = False
+                right_ok = False
+                slight_right_ok = False
+            elif rtype == "only_left_turn":
+                thru_ok = False
+                right_ok = False
+                slight_right_ok = False
+            elif rtype == "only_right_turn":
+                thru_ok = False
+                left_ok = False
+                slight_left_ok = False
+
+        return left_ok, slight_left_ok, thru_ok, slight_right_ok, right_ok
+
+    def _filter_slots(
+        slots: list[str] | None,
+        legal: tuple[bool, bool, bool, bool, bool],
+    ) -> tuple[list[str] | None, bool]:
+        if not slots:
+            return None, False
+        left_ok, sl_ok, thru_ok, sr_ok, right_ok = legal
+        out: list[str] = []
+        changed = False
+        for slot in slots:
+            if slot == "none":
+                out.append("none")
+                continue
+            parts = [p.strip() for p in slot.split(";") if p.strip()]
+            kept: list[str] = []
+            had_turn = False
+            for p in parts:
+                if p in {"left", "merge_to_left"}:
+                    had_turn = True
+                    if left_ok:
+                        kept.append(p)
+                elif p == "slight_left":
+                    had_turn = True
+                    if sl_ok:
+                        kept.append(p)
+                elif p in {"right", "merge_to_right"}:
+                    had_turn = True
+                    if right_ok:
+                        kept.append(p)
+                elif p == "slight_right":
+                    had_turn = True
+                    if sr_ok:
+                        kept.append(p)
+                elif p == "through":
+                    kept.append(p)
+                else:
+                    kept.append(p)
+            if not kept and had_turn:
+                new_slot = "through" if thru_ok else "none"
+            elif not kept:
+                new_slot = "none"
+            else:
+                new_slot = ";".join(kept)
+            if new_slot != slot:
+                changed = True
+            out.append(new_slot)
+        if not any(s not in {"none", "through"} for s in out):
+            return None, changed or True
+        return out, changed
+
+    suppressed_fwd = 0
+    suppressed_rev = 0
+    for edge in physical_edges:
+        if edge.get("intersection_internal"):
+            continue
+        tlf = edge.get("turn_lanes_fwd")
+        if tlf:
+            legal_f = _legal_dirs_for_slot(edge, arriving_at_v=True)
+            cleaned_f, chg_f = _filter_slots(tlf, legal_f)
+            if chg_f:
+                suppressed_fwd += 1
+                edge["turn_lanes_fwd"] = cleaned_f
+                edge["turn_lanes_forward"] = cleaned_f
+            if not legal_f[4] and int(edge.get("right_pocket_lanes", 0) or 0) > 0:
+                edge["right_pocket_lanes"] = 0
+
+        if bool(edge.get("bidirectional")):
+            tlr = edge.get("turn_lanes_rev")
+            if tlr:
+                legal_r = _legal_dirs_for_slot(edge, arriving_at_v=False)
+                cleaned_r, chg_r = _filter_slots(tlr, legal_r)
+                if chg_r:
+                    suppressed_rev += 1
+                    edge["turn_lanes_rev"] = cleaned_r
+                    edge["turn_lanes_backward"] = cleaned_r
+
+    return suppressed_fwd, suppressed_rev
 
 
 def _normalize_divided_widths_and_lanes(
@@ -2032,10 +2509,10 @@ def _normalize_divided_widths_and_lanes(
                     continue
                 b2 = boxes[idx2]
                 if (
-                    b2[1] < b1[0] - 26.0
-                    or b2[0] > b1[1] + 26.0
-                    or b2[3] < b1[2] - 26.0
-                    or b2[2] > b1[3] + 26.0
+                    b2[1] < b1[0] - 34.0
+                    or b2[0] > b1[1] + 34.0
+                    or b2[3] < b1[2] - 34.0
+                    or b2[2] > b1[3] + 34.0
                 ):
                     continue
                 pts2 = pts_xz_cache[idx2]
@@ -2054,7 +2531,7 @@ def _normalize_divided_widths_and_lanes(
                 for frac in fracs:
                     sx, sz, st = _sample_polyline_with_tangent(shorter, frac)
                     d = _point_lateral_opposite_dist_m(sx, sz, st, longer)
-                    if 2.0 < d < 24.0:
+                    if 2.0 < d < 32.0:
                         hits.append(d)
                 if len(hits) >= 2:
                     twins.append(
@@ -2194,11 +2671,19 @@ def _align_divided_left_turn_lanes(
     physical_edges: list[dict[str, Any]],
     twin_pairs: list[tuple[str, str, float]],
 ) -> None:
-    """Keep outer curbs & through lanes straight when a divided carriageway opens +1 left-turn bay."""
+    """Keep outer curbs & through lanes straight when a divided carriageway opens +1 left or right turn bay."""
     twin_edge_ids: set[str] = set()
-    for id1, id2, _ in twin_pairs:
+    twin_info_by_edge: dict[str, tuple[float, str]] = {}
+    edge_by_id: dict[str, dict[str, Any]] = {str(e["id"]): e for e in physical_edges}
+    for id1, id2, tdist in twin_pairs:
         twin_edge_ids.add(id1)
         twin_edge_ids.add(id2)
+        prev1 = twin_info_by_edge.get(id1)
+        if prev1 is None or tdist < prev1[0]:
+            twin_info_by_edge[id1] = (tdist, id2)
+        prev2 = twin_info_by_edge.get(id2)
+        if prev2 is None or tdist < prev2[0]:
+            twin_info_by_edge[id2] = (tdist, id1)
 
     inc_by_nl: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
     touches_roundabout: set[tuple[int, int]] = set()
@@ -2230,6 +2715,8 @@ def _align_divided_left_turn_lanes(
             str(e_narrow["highway"]) not in allowed_hw
             or str(e_wide["highway"]) not in allowed_hw
         ):
+            continue
+        if e_narrow.get("placement") or e_wide.get("placement"):
             continue
         n0 = str(e_narrow.get("street_name") or "").strip()
         n1 = str(e_wide.get("street_name") or "").strip()
@@ -2266,10 +2753,72 @@ def _align_divided_left_turn_lanes(
         wide_core_lanes = int(e_wide["lanes"]) - rp_wide
         narrow_lanes = int(e_narrow["lanes"])
         if narrow_lanes >= 2 and wide_core_lanes == narrow_lanes + 1:
-            e_narrow["lane_shift_right_m"] = 1.75
-            e_wide["_left_bay_prev_inner_m"] = round(float(e_narrow["width_m"]) * 0.5 - 1.75, 3)
             if rp_wide == 1:
-                e_wide["lane_shift_right_m"] = 1.75
+                # 1 left pocket + 1 right pocket already centers the through lanes!
+                e_wide["lane_shift_right_m"] = 0.0
+                continue
+            twin_pair = twin_info_by_edge.get(str(e_wide["id"]))
+            can_shift_inward = False
+            if twin_pair is not None:
+                tdist, opp_id = twin_pair
+                opp_e = edge_by_id.get(opp_id)
+                opp_inner = (float(opp_e["width_m"]) * 0.5 - float(opp_e.get("lane_shift_right_m", 0.0) or 0.0)) if opp_e else 3.5
+                wide_inner_shifted = float(e_wide["width_m"]) * 0.5 + 1.75
+                if tdist - (wide_inner_shifted + opp_inner) >= 0.75:
+                    can_shift_inward = True
+            if can_shift_inward:
+                # Wide median: shift the left-turn bay INWARD toward the median so outer curbs and through lanes stay straight
+                e_wide["lane_shift_right_m"] = -1.75
+            else:
+                e_narrow["lane_shift_right_m"] = 1.75
+                e_wide["_left_bay_prev_inner_m"] = round(float(e_narrow["width_m"]) * 0.5 - 1.75, 3)
+                # Also propagate +1.75m shift to collinear straight-ahead exit across the intersection so through lanes stay collinear
+                dest_v = int(e_wide["v"])
+                out_dir_w = _outgoing_dir_xz(e_wide["geometry"], from_start=False)
+                in_w = (-out_dir_w[0], -out_dir_w[1])
+                for cand in inc_by_nl.get((dest_v, lay), []):
+                    if (
+                        cand["id"] != e_wide["id"]
+                        and int(cand["u"]) == dest_v
+                        and bool(cand.get("oneway"))
+                        and not cand.get("placement")
+                        and cand.get("lane_shift_right_m") is None
+                        and int(cand["lanes"]) == narrow_lanes
+                        and str(cand.get("street_name") or "").strip() == n1
+                        and not any(bool(oe.get("bidirectional")) for oe in inc_by_nl.get((int(cand["v"]), lay), []))
+                    ):
+                        cd = _outgoing_dir_xz(cand["geometry"], from_start=True)
+                        if cd[0] * in_w[0] + cd[1] * in_w[1] >= 0.94:
+                            cand["lane_shift_right_m"] = 1.75
+                            break
+
+    # Right-turn pocket only (without left pocket): shift right +1.75m so inner yellow line & through lanes stay straight
+    for e in physical_edges:
+        if (
+            not bool(e.get("oneway"))
+            or int(e.get("layer", 0)) != 0
+            or str(e.get("highway", "")) not in allowed_hw
+            or e.get("placement")
+            or e.get("lane_shift_right_m") is not None
+            or str(e["id"]) not in twin_edge_ids
+        ):
+            continue
+        L = int(e["lanes"])
+        tf = e.get("turn_lanes_fwd") or []
+        has_left = bool(tf and tf[0] in {"left", "slight_left"})
+        has_right = (
+            int(e.get("right_pocket_lanes", 0) or 0) > 0
+            or (
+                len(tf) >= 3
+                and len(tf) == L
+                and tf[-1] in {"right", "slight_right"}
+                and tf[-2] not in {"right", "slight_right"}
+                and not float(e.get("bike_lane_right", False))
+                and str(e.get("bike_lane_right_type", "none")) == "none"
+            )
+        )
+        if has_right and not has_left:
+            e["lane_shift_right_m"] = 1.75
 
 
 def _align_and_straighten_divided_approaches(
@@ -2607,6 +3156,24 @@ def _build_intersection_topology(
                 b2_cut = _sample_xyz_along_geom(b2_e["geometry"], s2, b2_from_start)
                 b2_out = _sample_tangent_xz_at_dist(b2_e["geometry"], s2, b2_from_start)
 
+                def _shift_cut_with_cs(ce: dict[str, Any], cut: list[float], out_d: list[float], at_u: bool) -> tuple[list[float], float]:
+                    l_off, r_off, _, _, y_off = _resolve_edge_cross_section_offsets(ce)
+                    mid_off = 0.5 * (l_off + r_off)
+                    fwd_dx, fwd_dz = (out_d[0], out_d[1]) if at_u else (-out_d[0], -out_d[1])
+                    rx_s, rz_s = -fwd_dz, fwd_dx
+                    shifted = (
+                        [round(cut[0] + rx_s * mid_off, 3), cut[1], round(cut[2] + rz_s * mid_off, 3)]
+                        if abs(mid_off) > 1e-3
+                        else cut
+                    )
+                    # yellow_offset_right in frame facing INTO split (opposite out_d)
+                    y_in_split = -(y_off - mid_off) if at_u else (y_off - mid_off)
+                    return shifted, round(y_in_split, 3)
+
+                t_cut, t_yellow_split = _shift_cut_with_cs(trunk_e, t_cut, t_out, t_from_start)
+                b1_cut, _ = _shift_cut_with_cs(b1_e, b1_cut, b1_out, b1_from_start)
+                b2_cut, _ = _shift_cut_with_cs(b2_e, b2_cut, b2_out, b2_from_start)
+
                 median_transitions.append(
                     {
                         "split_node": nid,
@@ -2620,6 +3187,7 @@ def _build_intersection_topology(
                             "reverse_lanes": int(trunk_e.get("reverse_lanes", 2)),
                             "lanes_both_ways": int(trunk_e.get("lanes_both_ways", 0)),
                             "u_at_split": t_from_start,
+                            "yellow_offset_right": t_yellow_split,
                         },
                         "branches": [
                             {
@@ -2987,8 +3555,9 @@ def _build_intersection_topology(
                     cur_edge["trim_end_m"] = max(float(cur_edge.get("trim_end_m", 0.0)), trim_m)
 
                 cut_xyz = _sample_xyz_along_geom(cur_edge["geometry"], trim_m, from_start=cur_from_start)
-                shift_r = float(cur_edge.get("lane_shift_right_m", 0.0) or 0.0)
-                if abs(shift_r) > 1e-3:
+                l_off, r_off, tl_off, tr_off, y_off = _resolve_edge_cross_section_offsets(cur_edge)
+                mid_off = 0.5 * (l_off + r_off)
+                if abs(mid_off) > 1e-3:
                     fwd_dx, fwd_dz = (
                         (cur_out_dir[0], cur_out_dir[1])
                         if cur_from_start
@@ -2996,12 +3565,26 @@ def _build_intersection_topology(
                     )
                     rx_s, rz_s = -fwd_dz, fwd_dx
                     cut_xyz = [
-                        round(cut_xyz[0] + rx_s * shift_r, 3),
+                        round(cut_xyz[0] + rx_s * mid_off, 3),
                         cut_xyz[1],
-                        round(cut_xyz[2] + rz_s * shift_r, 3),
+                        round(cut_xyz[2] + rz_s * mid_off, 3),
                     ]
                 bidir = bool(cur_edge["bidirectional"])
                 is_incoming = bidir or (not cur_from_start)
+                edge_fwd_lanes = int(cur_edge.get("lanes_forward", cur_edge.get("forward_lanes", cur_edge["lanes"])))
+                edge_rev_lanes = int(cur_edge.get("lanes_backward", cur_edge.get("reverse_lanes", 0)))
+                app_in_lanes = (edge_rev_lanes if cur_from_start else edge_fwd_lanes) if bidir else int(cur_edge["lanes"])
+                app_out_lanes = (edge_fwd_lanes if cur_from_start else edge_rev_lanes) if bidir else 0
+                yellow_off_right = round((y_off - mid_off) if cur_from_start else -(y_off - mid_off), 3)
+                if bidir:
+                    if cur_from_start:
+                        in_span = [round(tl_off - mid_off, 3), round(tl_off + edge_rev_lanes * 3.5 - mid_off, 3)]
+                    else:
+                        in_span = [round(mid_off - tr_off, 3), round(mid_off - (tr_off - edge_fwd_lanes * 3.5), 3)]
+                else:
+                    in_span = [round(mid_off - tr_off, 3), round(mid_off - tl_off, 3)] if is_incoming else None
+                t_left_app = round((tl_off - mid_off) if cur_from_start else (mid_off - tr_off), 3)
+                t_right_app = round((tr_off - mid_off) if cur_from_start else (mid_off - tl_off), 3)
                 turn_lanes = (cur_edge.get("turn_lanes_rev") if bidir else None) if cur_from_start else cur_edge.get("turn_lanes_fwd")
                 cur_cw = str(graph.nodes[cur_corner].get("crosswalk_markings") or "ladder")
                 orig_cw = str(graph.nodes[it["corner_nid"]].get("crosswalk_markings") or "ladder")
@@ -3019,14 +3602,18 @@ def _build_intersection_topology(
                         "leg_dir_xz": [round(leg_dx, 6), round(leg_dz, 6)],
                         "half_width": round(float(cur_edge["width_m"]) * 0.5, 3),
                         "lanes": int(cur_edge["lanes"]),
-                        "forward_lanes": int(cur_edge.get("forward_lanes", cur_edge["lanes"])),
-                        "reverse_lanes": int(cur_edge.get("reverse_lanes", 0)),
+                        "forward_lanes": app_in_lanes,
+                        "reverse_lanes": app_out_lanes,
                         "lanes_both_ways": int(cur_edge.get("lanes_both_ways", 0)),
                         "bidirectional": bidir,
                         "is_incoming": is_incoming,
                         "turn_lanes": turn_lanes,
                         "crosswalk_markings": cw_mark,
                         "street_name": cur_edge.get("street_name"),
+                        "yellow_offset_right": yellow_off_right,
+                        "incoming_span_offset": in_span,
+                        "traffic_left_offset": t_left_app,
+                        "traffic_right_offset": t_right_app,
                     }
                 )
 
@@ -3122,9 +3709,51 @@ def _closest_point_on_geom_xz(px: float, pz: float, geom: list[list[float]], tx:
     return hit[:4] if hit is not None else None
 
 
+def _intersect_perp_ray_with_geom_xz(
+    px: float,
+    pz: float,
+    tx: float,
+    tz: float,
+    geom: list[list[float]],
+) -> tuple[float, float, float, float, float] | None:
+    """Intersect exact perpendicular cross-section ray from ``(px, pz)`` against opposite segments of ``geom``."""
+    # Inward left normal relative to travel tangent (tx, tz) in (+X east, +Z south): (tz, -tx)
+    nx, nz = tz, -tx
+    best_abs_lam = float("inf")
+    best_pt: tuple[float, float, float, float, float] | None = None
+    cum_s = 0.0
+    for i in range(len(geom) - 1):
+        ax, ay, az = geom[i]
+        bx, by, bz = geom[i + 1]
+        dx, dy, dz = bx - ax, by - ay, bz - az
+        seg_len_sq = dx * dx + dz * dz
+        seg_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if seg_len_sq > 1e-6:
+            seg_len = math.sqrt(seg_len_sq)
+            if tx * (dx / seg_len) + tz * (dz / seg_len) <= -0.55:
+                # Solve (px + lam*nx, pz + lam*nz) == (ax + t*dx, az + t*dz)
+                denom = nx * dz - nz * dx
+                if abs(denom) > 1e-5:
+                    rx, rz = ax - px, az - pz
+                    lam = (rx * dz - rz * dx) / denom
+                    t = (rx * nz - rz * nx) / denom
+                    if -0.02 <= t <= 1.02 and lam > 0.0:
+                        t_clamped = max(0.0, min(1.0, t))
+                        qx = ax + dx * t_clamped
+                        qy = ay + dy * t_clamped
+                        qz = az + dz * t_clamped
+                        dist = math.hypot(qx - px, qz - pz)
+                        if abs(lam) < best_abs_lam:
+                            best_abs_lam = abs(lam)
+                            best_pt = (qx, qy, qz, dist, cum_s + seg_3d * t_clamped)
+        cum_s += seg_3d
+    return best_pt
+
+
 def _edge_inner_half_at_s(edge: dict[str, Any], s_along: float) -> float:
-    """Return inner (median-facing) half-width along ``edge``, matching smoothstep left-bay openings."""
-    base_inner = float(edge["width_m"]) * 0.5 - float(edge.get("lane_shift_right_m", 0.0) or 0.0)
+    """Return inner (median-facing, left-curb) offset distance from OSM centerline along ``edge``."""
+    left_off, _, _, _, _ = _resolve_edge_cross_section_offsets(edge)
+    base_inner = max(0.5, -left_off)
     prev_inner = edge.get("_left_bay_prev_inner_m")
     if prev_inner is None:
         return base_inner
@@ -3142,9 +3771,50 @@ def _edge_inner_half_at_s(edge: dict[str, Any], s_along: float) -> float:
 def _build_median_islands(
     edge_map: dict[str, dict[str, Any]],
     twin_pairs: list[tuple[str, str, float]],
+    node_approaches: dict[int, list[dict[str, Any]]] | None = None,
+    graph: nx.MultiDiGraph | None = None,
     tram_grid: dict[tuple[int, int], list[tuple[list[tuple[float, float]], int]]] | None = None,
 ) -> list[dict[str, Any]]:
     """Generate raised curbed concrete median strip polylines between opposite carriageways."""
+    def _endpoint_crosswalk_setback(edge: dict[str, Any], at_start: bool) -> tuple[float, bool]:
+        trim = float(edge.get("trim_start_m", 0.0) if at_start else edge.get("trim_end_m", 0.0)) or 0.0
+        nid = int(edge["u"]) if at_start else int(edge["v"])
+        ndata = graph.nodes[nid] if (graph is not None and nid in graph.nodes) else {}
+        if str(ndata.get("node_type") or "") == "median_split":
+            return trim, False
+        if trim > 0.0:
+            return trim, True
+        if node_approaches is None:
+            return 0.0, False
+        lay = int(edge["layer"])
+        layer_apps = [a for a in node_approaches.get(nid, []) if int(a.get("layer", 0)) == lay]
+        has_ctrl = bool(ndata.get("traffic_signal") or ndata.get("stop_sign") or ndata.get("has_crossing"))
+        if len(layer_apps) < 3 and not (len(layer_apps) >= 2 and has_ctrl):
+            return 0.0, False
+        self_app = next((a for a in layer_apps if str(a["edge_id"]) == str(edge["id"])), None)
+        if not self_app:
+            return 0.0, False
+        h_i = float(self_app["width_m"]) * 0.5
+        dx_i, dz_i = float(self_app["dir_xz"][0]), float(self_app["dir_xz"][1])
+        max_hw = max(float(a["width_m"]) * 0.5 for a in layer_apps)
+        setback = 0.0
+        for a_j in layer_apps:
+            if str(a_j["edge_id"]) == str(edge["id"]):
+                continue
+            h_j = float(a_j["width_m"]) * 0.5
+            dx_j, dz_j = float(a_j["dir_xz"][0]), float(a_j["dir_xz"][1])
+            dot = dx_i * dx_j + dz_i * dz_j
+            cross = abs(dx_i * dz_j - dz_i * dx_j)
+            if cross > 0.25:
+                setback = max(setback, (h_j + h_i * max(0.0, dot)) / max(cross, 0.55))
+            elif dot > 0.85:
+                setback = max(setback, h_j)
+        if setback <= 0.0:
+            setback = 0.5 if len(layer_apps) < 3 else max_hw
+        clamped = max(0.5, min(max(8.0, max_hw + 6.5), setback)) + 1.4
+        max_by_edge = max(0.25, (float(edge["length_m"]) - 1.2) * 0.45)
+        return min(clamped, max_by_edge), True
+
     islands: list[dict[str, Any]] = []
     for id1, id2, _ in twin_pairs:
         e1 = edge_map.get(id1)
@@ -3162,53 +3832,80 @@ def _build_median_islands(
         geom2 = e2["geometry"]
         pts1_xz = [(float(p[0]), float(p[2])) for p in geom1]
 
-        trim_s = float(e1.get("trim_start_m", 0.0))
-        trim_e = float(e1.get("trim_end_m", 0.0))
-        s0 = trim_s + (3.6 if trim_s > 0.0 else 0.2)
-        s1 = float(e1["length_m"]) - trim_e - (3.6 if trim_e > 0.0 else 0.2)
+        cw1_s, has_cw1_s = _endpoint_crosswalk_setback(e1, at_start=True)
+        cw1_e, has_cw1_e = _endpoint_crosswalk_setback(e1, at_start=False)
+        cw2_s, has_cw2_s = _endpoint_crosswalk_setback(e2, at_start=True)
+        cw2_e, has_cw2_e = _endpoint_crosswalk_setback(e2, at_start=False)
+
+        len1 = float(e1["length_m"])
+        len2 = float(e2["length_m"])
+        s0 = cw1_s + (3.0 if has_cw1_s else (1.0 if cw1_s > 0.0 else 0.2))
+        s1 = len1 - cw1_e - (3.0 if has_cw1_e else (1.0 if cw1_e > 0.0 else 0.2))
         if s1 - s0 < 6.0:
             continue
 
+        e2_min_s = cw2_s + (3.0 if has_cw2_s else (1.0 if cw2_s > 0.0 else 0.0))
+        e2_max_s = len2 - cw2_e - (3.0 if has_cw2_e else (1.0 if cw2_e > 0.0 else 0.0))
+
         sample_count = max(6, min(120, int((s1 - s0) / 3.0) + 2))
-        raw_samples: list[tuple[list[float], float]] = []
+        raw_samples: list[tuple[list[float], float, float, float]] = []
 
         for step in range(sample_count):
             s = s0 + (s1 - s0) * (step / (sample_count - 1))
-            frac = max(0.0, min(1.0, s / max(1e-4, float(e1["length_m"]))))
+            frac = max(0.0, min(1.0, s / max(1e-4, len1)))
             px, py, pz = _sample_xyz_along_geom(geom1, s, from_start=True)
             _, _, tang = _sample_polyline_with_tangent(pts1_xz, frac)
-            match = _closest_point_with_s_on_geom_xz(px, pz, geom2, tang[0], tang[1])
+            match = _intersect_perp_ray_with_geom_xz(px, pz, tang[0], tang[1], geom2)
+            if match is None:
+                match = _closest_point_with_s_on_geom_xz(px, pz, geom2, tang[0], tang[1])
             if match is None:
                 continue
             qx, qy, qz, dist, s2 = match
+            if s2 < e2_min_s or s2 > e2_max_s:
+                continue
             in1 = _edge_inner_half_at_s(e1, s)
             in2 = _edge_inner_half_at_s(e2, s2)
             gap = dist - (in1 + in2)
-            if gap < 0.38 or dist > 26.0:
+            if gap < 0.38 or gap > 16.0 or dist > 34.0:
                 continue
             ux, uz = (qx - px) / dist, (qz - pz) / dist
             in1_x, in1_z = px + ux * in1, pz + uz * in1
             in2_x, in2_z = qx - ux * in2, qz - uz * in2
             pt = [round((in1_x + in2_x) * 0.5, 3), round((py + qy) * 0.5, 3), round((in1_z + in2_z) * 0.5, 3)]
-            raw_samples.append((pt, gap))
+            raw_samples.append((pt, gap, s, s2))
 
         if len(raw_samples) >= 2:
             # Keep only the stable non-pinched median corridor (allow smooth wide median tapers)
-            sorted_gaps = sorted(g for _, g in raw_samples)
+            sorted_gaps = sorted(item[1] for item in raw_samples)
             nominal_gap = sorted_gaps[len(sorted_gaps) // 2]
             min_keep_gap = max(0.45, nominal_gap * (0.50 if nominal_gap >= 1.4 else 0.88))
 
-            best_run: list[tuple[list[float], float]] = []
-            curr_run: list[tuple[list[float], float]] = []
-            for pt, g in raw_samples:
-                if g >= min_keep_gap:
-                    curr_run.append((pt, g))
+            best_run: list[tuple[list[float], float, float, float]] = []
+            curr_run: list[tuple[list[float], float, float, float]] = []
+            for item in raw_samples:
+                if item[1] >= min_keep_gap:
+                    curr_run.append(item)
                 else:
                     if len(curr_run) > len(best_run):
                         best_run = curr_run
                     curr_run = []
             if len(curr_run) > len(best_run):
                 best_run = curr_run
+
+            # Trim bullnose cap length at crosswalk ends so the rounded tip ends 3.0m behind crosswalk
+            if len(best_run) >= 3:
+                nom_w = min(max(0.36, nominal_gap - 0.34), 15.6)
+                cap_trim = min(1.4, (nom_w * 0.5) * 0.85)
+                if cap_trim > 0.25:
+                    filtered_run = [
+                        item for item in best_run
+                        if (not has_cw1_s or item[2] >= cw1_s + 3.0 + cap_trim)
+                        and (not has_cw1_e or item[2] <= len1 - cw1_e - 3.0 - cap_trim)
+                        and (not has_cw2_s or item[3] >= cw2_s + 3.0 + cap_trim)
+                        and (not has_cw2_e or item[3] <= len2 - cw2_e - 3.0 - cap_trim)
+                    ]
+                    if len(filtered_run) >= 2:
+                        best_run = filtered_run
 
             if len(best_run) >= 2:
                 pts_kept = [item[0] for item in best_run]
@@ -3218,8 +3915,12 @@ def _build_median_islands(
                 ):
                     continue
                 gaps_kept = [item[1] for item in best_run]
-                w_conc_list = [round(min(max(0.36, g - 0.34), 7.8), 3) for g in gaps_kept]
-                w_gut_list = [round(g + 0.34, 3) if g <= 8.5 else 0.0 for g in gaps_kept]
+                w_conc_list = [round(min(max(0.36, g - 0.34), 15.6), 3) for g in gaps_kept]
+                w_gut_list = [round(g + 0.34, 3) if g <= 16.4 else 0.0 for g in gaps_kept]
+                # Straighten parallel curb runs where width variations are tiny noise (<0.4m)
+                nom_conc = round(min(max(0.36, nominal_gap - 0.34), 15.6), 3)
+                if max(abs(w - nom_conc) for w in w_conc_list) <= 0.40:
+                    w_conc_list = [round(0.55 * w + 0.45 * nom_conc, 3) for w in w_conc_list]
                 # Light 1-pass smoothing on interior centerline points and widths so curbs never wobble
                 if len(pts_kept) >= 4:
                     smoothed = [pts_kept[0]]
@@ -3983,7 +4684,13 @@ def project_and_clean_graph(
         turn_lanes_fwd, turn_lanes_rev = clean_turn_lanes(
             data, oneway=oneway, fwd_lanes=forward_lanes, rev_lanes=reverse_lanes, highway=highway
         )
-        placement_clean = clean_placement(data, oneway=oneway)
+        placement_clean = clean_placement(
+            data,
+            oneway=oneway,
+            fwd_lanes=forward_lanes,
+            rev_lanes=reverse_lanes,
+            center_extra=lanes_both_ways + lanes_reversible,
+        )
         has_bike_lane, bike_lane_left, bike_lane_right, b_left_t, b_right_t = clean_cycleway(data, oneway=oneway)
         bus_fwd, bus_rev, hov_fwd, chg_fwd = parse_bus_and_hov_lanes(
             data, oneway=oneway, fwd_lanes=forward_lanes, rev_lanes=reverse_lanes
@@ -4934,7 +5641,7 @@ def _orient_reverse_edge_attrs(tdict: dict[str, Any], *, is_synthetic_reverse: b
             rev.pop(k_a, None)
 
     if is_synthetic_reverse:
-        for bare_k in ("turn:lanes", "bus:lanes", "psv:lanes", "hov:lanes", "change:lanes", "lanes:bus"):
+        for bare_k in ("turn:lanes", "bus:lanes", "psv:lanes", "hov:lanes", "change:lanes", "lanes:bus", "placement"):
             if f"{bare_k}:backward" not in tdict and bare_k in rev:
                 rev.pop(bare_k, None)
         bay = str(tdict.get("bus_bay") or "").strip().lower()

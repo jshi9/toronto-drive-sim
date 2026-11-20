@@ -94,6 +94,7 @@ export interface LiveSplitEndpointCapture {
   cutPt: THREE.Vector3;
   leftPt: THREE.Vector3;
   rightPt: THREE.Vector3;
+  yellowPt?: THREE.Vector3;
   outDir: THREE.Vector3;
   isTrunk: boolean;
   lanes: number;
@@ -486,13 +487,23 @@ export class IntersectionDetailBuilder {
           incomingLanes,
           app.lanes,
           originOffset,
+          app.incoming_span_offset,
         );
       }
     }
 
-    // 4. Convergent curved dashed left-turn guide arcs extending tightly from each leg's middle island
-    if (group.signalized && legs.length >= 3) {
-      this.appendGroupedLeftTurnGuideArcs(paintTarget, legs, surfaceSampler, originOffset);
+    // 4. Convergent curved dashed left-turn guide arcs & OTM Book 11 through-lane continuity guide lines
+    if (legs.length >= 3) {
+      if (group.signalized) {
+        this.appendGroupedLeftTurnGuideArcs(paintTarget, legs, surfaceSampler, originOffset);
+      }
+      this.appendThroughLaneContinuityGuideLines(
+        paintTarget,
+        legs,
+        surfaceSampler,
+        originOffset,
+        group.has_crosswalks,
+      );
     }
   }
 
@@ -565,17 +576,26 @@ export class IntersectionDetailBuilder {
     const leftDirLanes = trunk.u_at_split
       ? Math.max(1, totalLanes - Math.max(1, trunk.reverse_lanes) - bothWays)
       : Math.max(1, trunk.reverse_lanes);
-    let yellowFrac = leftDirLanes / totalLanes;
-    if (bothWays === 1) {
-      if (bRight.lanes > bLeft.lanes) {
-        yellowFrac = leftDirLanes / totalLanes;
-      } else if (bLeft.lanes > bRight.lanes) {
-        yellowFrac = (leftDirLanes + 1) / totalLanes;
-      } else {
-        yellowFrac = (leftDirLanes + 0.5) / totalLanes;
+    let trunkYellow: THREE.Vector3;
+    if (liveTrunk?.yellowPt) {
+      trunkYellow = liveTrunk.yellowPt.clone().sub(originOffset);
+    } else if (trunk.yellow_offset_right !== undefined) {
+      trunkYellow = tPos
+        .clone()
+        .addScaledVector(new THREE.Vector3(rightX, 0, rightZ), trunk.yellow_offset_right);
+    } else {
+      let yellowFrac = leftDirLanes / totalLanes;
+      if (bothWays === 1) {
+        if (bRight.lanes > bLeft.lanes) {
+          yellowFrac = leftDirLanes / totalLanes;
+        } else if (bLeft.lanes > bRight.lanes) {
+          yellowFrac = (leftDirLanes + 1) / totalLanes;
+        } else {
+          yellowFrac = (leftDirLanes + 0.5) / totalLanes;
+        }
       }
+      trunkYellow = new THREE.Vector3().lerpVectors(trunkL, trunkR, yellowFrac);
     }
-    const trunkYellow = new THREE.Vector3().lerpVectors(trunkL, trunkR, yellowFrac);
     const yellowOffsetAlongTrunkRight =
       (trunkYellow.x - tPos.x) * rightX + (trunkYellow.z - tPos.z) * rightZ;
     const trunkYellowL = trunkYellow
@@ -669,10 +689,12 @@ export class IntersectionDetailBuilder {
       scale: number,
       t: number,
     ): THREE.Vector3 => {
-      // Keep collinear arterial splits strictly linear so lane dividers & yellow gores never S-bend
-      if (d0.dot(d1) >= 0.95) {
+      // Smooth C1 cubic Hermite blend; for nearly collinear splits, blend gently without C0 kinks
+      const chord = Math.hypot(p1.x - p0.x, p1.z - p0.z);
+      if (chord < 2.0) {
         return new THREE.Vector3().lerpVectors(p0, p1, t);
       }
+      const effScale = d0.dot(d1) >= 0.95 ? Math.min(scale, chord * 0.42) : scale;
       const t2 = t * t;
       const t3 = t2 * t;
       const h00 = 2 * t3 - 3 * t2 + 1;
@@ -680,9 +702,9 @@ export class IntersectionDetailBuilder {
       const h01 = -2 * t3 + 3 * t2;
       const h11 = t3 - t2;
       return new THREE.Vector3(
-        h00 * p0.x + h10 * d0.x * scale + h01 * p1.x + h11 * d1.x * scale,
+        h00 * p0.x + h10 * d0.x * effScale + h01 * p1.x + h11 * d1.x * effScale,
         p0.y * (1 - t) + p1.y * t,
-        h00 * p0.z + h10 * d0.z * scale + h01 * p1.z + h11 * d1.z * scale,
+        h00 * p0.z + h10 * d0.z * effScale + h01 * p1.z + h11 * d1.z * effScale,
       );
     };
 
@@ -771,12 +793,17 @@ export class IntersectionDetailBuilder {
       c: THREE.Vector3,
       d: THREE.Vector3,
     ) => {
+      const drop = -0.004;
+      const da = new THREE.Vector3(a.x, a.y + drop, a.z);
+      const db = new THREE.Vector3(b.x, b.y + drop, b.z);
+      const dc = new THREE.Vector3(c.x, c.y + drop, c.z);
+      const dd = new THREE.Vector3(d.x, d.y + drop, d.z);
       // Ensure +Y normal regardless of orientation
-      const crossY = (b.z - a.z) * (c.x - a.x) - (b.x - a.x) * (c.z - a.z);
+      const crossY = (db.z - da.z) * (dc.x - da.x) - (db.x - da.x) * (dc.z - da.z);
       if (crossY >= 0) {
-        appendQuadToBuffers(apronTarget, a, b, c, d, WORLD_UP);
+        appendQuadToBuffers(apronTarget, da, db, dc, dd, WORLD_UP);
       } else {
-        appendQuadToBuffers(apronTarget, a, d, c, b, WORLD_UP);
+        appendQuadToBuffers(apronTarget, da, dd, dc, db, WORLD_UP);
       }
     };
 
@@ -1219,6 +1246,8 @@ export class IntersectionDetailBuilder {
       uWidened?: boolean;
       vWidened?: boolean;
       rightPocketLimitM?: number | undefined;
+      uLegalTurns?: { left: boolean; through: boolean; right: boolean };
+      vLegalTurns?: { left: boolean; through: boolean; right: boolean };
     },
   ): void {
     const totalLen = distances[distances.length - 1] ?? 0;
@@ -1233,22 +1262,78 @@ export class IntersectionDetailBuilder {
     const trafficLeftOffsetM = approachMeta?.trafficLeftOffsetM ?? -roadWidth * 0.5;
     const laneW = 3.5;
 
-    const rawFwdSlots = edge.turn_lanes_forward ?? edge.turn_lanes_fwd ?? null;
-    const rawRevSlots = edge.turn_lanes_backward ?? edge.turn_lanes_rev ?? null;
+    const filterTurnSlotsByLegality = (
+      slots: string[] | null | undefined,
+      legal: { left: boolean; through: boolean; right: boolean } | undefined,
+    ): string[] | null => {
+      if (!slots || slots.length === 0) {
+        return null;
+      }
+      if (!legal) {
+        return slots;
+      }
+      const out: string[] = [];
+      for (const slot of slots) {
+        if (slot === 'none') {
+          out.push('none');
+          continue;
+        }
+        const parts = slot
+          .split(';')
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
+        const kept: string[] = [];
+        let hadTurn = false;
+        for (const p of parts) {
+          if (p === 'left' || p === 'slight_left' || p === 'merge_to_left') {
+            hadTurn = true;
+            if (legal.left) {
+              kept.push(p);
+            }
+          } else if (p === 'right' || p === 'slight_right' || p === 'merge_to_right') {
+            hadTurn = true;
+            if (legal.right) {
+              kept.push(p);
+            }
+          } else {
+            kept.push(p);
+          }
+        }
+        if (kept.length === 0 && hadTurn) {
+          out.push(legal.through ? 'through' : 'none');
+        } else if (kept.length === 0) {
+          out.push('none');
+        } else {
+          out.push(kept.join(';'));
+        }
+      }
+      return out.some((s) => s !== 'none' && s !== 'through') ? out : null;
+    };
+
+    const rawFwdSlots = filterTurnSlotsByLegality(
+      edge.turn_lanes_forward ?? edge.turn_lanes_fwd ?? null,
+      approachMeta?.vLegalTurns,
+    );
+    const rawRevSlots = filterTurnSlotsByLegality(
+      edge.turn_lanes_backward ?? edge.turn_lanes_rev ?? null,
+      approachMeta?.uLegalTurns,
+    );
 
     // Auto-infer LEFT + THROUGH arrows when an approach widened for an intersection bay without explicit turn:lanes tags
     const autoFwdSlots =
       (!rawFwdSlots || rawFwdSlots.length === 0) &&
       approachMeta?.vIncomingControlled &&
       approachMeta?.vWidened &&
-      forwardLanes >= 2
+      forwardLanes >= 2 &&
+      approachMeta?.vLegalTurns?.left !== false
         ? ['left', ...Array(Math.max(0, forwardLanes - 1)).fill('through')]
         : rawFwdSlots;
     const autoRevSlots =
       (!rawRevSlots || rawRevSlots.length === 0) &&
       approachMeta?.uIncomingControlled &&
       approachMeta?.uWidened &&
-      reverseLanes >= 2
+      reverseLanes >= 2 &&
+      approachMeta?.uLegalTurns?.left !== false
         ? ['left', ...Array(Math.max(0, reverseLanes - 1)).fill('through')]
         : rawRevSlots;
 
@@ -1375,6 +1460,60 @@ export class IntersectionDetailBuilder {
   }
 
   /**
+   * Appends OTM Book 11 dotted white through-lane continuity guide lines across
+   * skewed, diagonal, or laterally offset single-node intersections.
+   */
+  public appendSingleNodeContinuityGuideLines(
+    paintTarget: DetailBuffers,
+    center: Vec3Tuple,
+    approaches: Array<{
+      cutPoint: THREE.Vector3;
+      outDir: THREE.Vector2;
+      halfWidth: number;
+      lanes: number;
+      bidirectional: boolean;
+      isIncoming: boolean;
+      forwardLanes: number;
+      reverseLanes: number;
+      lanesBothWays?: number;
+      turnLanes?: string[] | null | undefined;
+      yellowOffsetRight?: number;
+    }>,
+    originOffset: THREE.Vector3,
+    options?: { hasCrosswalks?: boolean },
+  ): void {
+    if (approaches.length < 3) {
+      return;
+    }
+    const legAdapters: (IntersectionGroupApproach & { yellowOffsetRight?: number })[] = approaches.map((a, idx) => ({
+      edge_id: `sn_${idx}`,
+      corner_node: 0,
+      leg_id: idx,
+      cut_point: [a.cutPoint.x, a.cutPoint.y, a.cutPoint.z],
+      out_dir_xz: [a.outDir.x, a.outDir.y],
+      leg_dir_xz: [a.outDir.x, a.outDir.y],
+      half_width: a.halfWidth,
+      lanes: a.lanes,
+      forward_lanes: a.forwardLanes,
+      reverse_lanes: a.reverseLanes,
+      ...(a.lanesBothWays !== undefined ? { lanes_both_ways: a.lanesBothWays } : {}),
+      bidirectional: a.bidirectional,
+      is_incoming: a.isIncoming,
+      turn_lanes: a.turnLanes ?? null,
+      ...(a.yellowOffsetRight !== undefined ? { yellowOffsetRight: a.yellowOffsetRight } : {}),
+    }));
+    const legs = legAdapters.map((a) => [a]);
+    const localCenterY = center[1] - originOffset.y;
+    this.appendThroughLaneContinuityGuideLines(
+      paintTarget,
+      legs,
+      () => localCenterY,
+      originOffset,
+      options?.hasCrosswalks ?? false,
+    );
+  }
+
+  /**
    * Extrudes a uniform-width straight concrete curbed median island polyline with
    * rounded bullnose end caps (avoiding diamond distortion on short/3-point segments).
    */
@@ -1384,6 +1523,7 @@ export class IntersectionDetailBuilder {
     concreteSide: DetailBuffers,
     apronTarget: DetailBuffers,
     originOffset: THREE.Vector3,
+    yellowPaintTarget?: DetailBuffers,
   ): void {
     const raw = island.centerline;
     if (raw.length < 2) {
@@ -1404,10 +1544,10 @@ export class IntersectionDetailBuilder {
     const gutterHalfWs: number[] = [];
     for (let i = 0; i < n; i++) {
       const concW = island.widths_m?.[i] ?? island.width_m;
-      const hw = Math.max(0.22, Math.min(4.2, concW * 0.5));
+      const hw = Math.max(0.22, Math.min(7.8, concW * 0.5));
       const curbBevel = Math.min(0.10, hw * 0.12);
       const gutW =
-        island.gutter_widths_m?.[i] ?? (island.width_m <= 4.2 ? island.width_m + 0.56 : 0);
+        island.gutter_widths_m?.[i] ?? (island.width_m <= 16.0 ? island.width_m + 0.56 : 0);
       halfWs.push(hw);
       wTops.push(Math.max(0.16, hw - curbBevel));
       wBots.push(hw);
@@ -1480,7 +1620,7 @@ export class IntersectionDetailBuilder {
       const p0 = pts[0]!;
       const r0 = rights[0]!;
       const d0 = dirs[0]!;
-      const padLen0 = Math.max(0.55, Math.min(1.15, halfWs[0]! * 0.85) * 1.1);
+      const padLen0 = Math.max(0.55, Math.min(1.4, halfWs[0]! * 0.85) * 1.1);
       const pExt = new THREE.Vector3(p0.x - d0.x * padLen0, p0.y + apronDrop, p0.z - d0.z * padLen0);
       appendQuadToBuffers(
         apronTarget,
@@ -1496,7 +1636,7 @@ export class IntersectionDetailBuilder {
       const pE = pts[n - 1]!;
       const rE = rights[n - 1]!;
       const dE = dirs[n - 1]!;
-      const padLenE = Math.max(0.55, Math.min(1.15, halfWs[n - 1]! * 0.85) * 1.1);
+      const padLenE = Math.max(0.55, Math.min(1.4, halfWs[n - 1]! * 0.85) * 1.1);
       const pExt = new THREE.Vector3(pE.x + dE.x * padLenE, pE.y + apronDrop, pE.z + dE.z * padLenE);
       appendQuadToBuffers(
         apronTarget,
@@ -1508,8 +1648,8 @@ export class IntersectionDetailBuilder {
       );
     }
 
-    // Smooth 6-segment semicircular concrete bullnose caps on both median ends
-    const capSegs = 6;
+    // Smooth 10-segment semicircular concrete bullnose caps on both median ends with yellow curb paint
+    const capSegs = 10;
     const emitBullnose = (
       anchor: THREE.Vector3,
       right: THREE.Vector3,
@@ -1518,9 +1658,13 @@ export class IntersectionDetailBuilder {
       wTop: number,
       wBot: number,
     ) => {
-      const capLen = Math.min(1.15, hwEnd * 0.85);
+      const capLen = Math.min(1.4, hwEnd * 0.85);
       const topArc: THREE.Vector3[] = [];
       const botArc: THREE.Vector3[] = [];
+      const innerRimArc: THREE.Vector3[] = [];
+      const rimBandW = Math.min(0.22, wTop * 0.45);
+      const innerRimLat = Math.max(0.05, wTop - rimBandW);
+      const innerRimFwd = Math.max(0.05, capLen - rimBandW);
       for (let s = 0; s <= capSegs; s++) {
         const theta = -Math.PI * 0.5 + (Math.PI * s) / capSegs;
         const latSin = Math.sin(theta);
@@ -1530,6 +1674,13 @@ export class IntersectionDetailBuilder {
             anchor.x + right.x * (wTop * latSin) + outDir.x * (capLen * fwdCos),
             anchor.y + curbHeight,
             anchor.z + right.z * (wTop * latSin) + outDir.z * (capLen * fwdCos),
+          ),
+        );
+        innerRimArc.push(
+          new THREE.Vector3(
+            anchor.x + right.x * (innerRimLat * latSin) + outDir.x * (innerRimFwd * fwdCos),
+            anchor.y + curbHeight + 0.006,
+            anchor.z + right.z * (innerRimLat * latSin) + outDir.z * (innerRimFwd * fwdCos),
           ),
         );
         botArc.push(
@@ -1577,6 +1728,68 @@ export class IntersectionDetailBuilder {
           right.z * Math.sin(thetaMid) + outDir.z * Math.cos(thetaMid),
         ).normalize();
         appendQuadToBuffers(concreteSide, b0, p0, p1, b1, sideNorm);
+
+        if (yellowPaintTarget) {
+          const yOff = sideNorm.clone().multiplyScalar(0.008);
+          appendQuadToBuffers(
+            yellowPaintTarget,
+            b0.clone().add(yOff),
+            p0.clone().add(yOff),
+            p1.clone().add(yOff),
+            b1.clone().add(yOff),
+            sideNorm,
+          );
+          const ir0 = innerRimArc[s]!;
+          const ir1 = innerRimArc[s + 1]!;
+          const pt0 = new THREE.Vector3(p0.x, p0.y + 0.006, p0.z);
+          const pt1 = new THREE.Vector3(p1.x, p1.y + 0.006, p1.z);
+          const rimCross = (pt0.z - ir0.z) * (pt1.x - ir0.x) - (pt0.x - ir0.x) * (pt1.z - ir0.z);
+          if (rimCross >= 0) {
+            appendQuadToBuffers(yellowPaintTarget, ir0, pt0, pt1, ir1, WORLD_UP);
+          } else {
+            appendQuadToBuffers(yellowPaintTarget, ir0, ir1, pt1, pt0, WORLD_UP);
+          }
+        }
+      }
+
+      if (yellowPaintTarget) {
+        // 0.85m yellow curb return strips along the straight flanks immediately behind the bullnose
+        const returnLen = 0.85;
+        for (const sideSign of [-1, 1] as const) {
+          const latOut = right.clone().multiplyScalar(sideSign);
+          const pTopA = new THREE.Vector3(
+            anchor.x + latOut.x * wTop,
+            anchor.y + curbHeight + 0.006,
+            anchor.z + latOut.z * wTop,
+          );
+          const pTopB = pTopA.clone().addScaledVector(outDir, -returnLen);
+          const pBotA = new THREE.Vector3(
+            anchor.x + latOut.x * wBot,
+            anchor.y + baseLift,
+            anchor.z + latOut.z * wBot,
+          );
+          const pBotB = pBotA.clone().addScaledVector(outDir, -returnLen);
+          const faceOff = latOut.clone().multiplyScalar(0.008);
+          if (sideSign < 0) {
+            appendQuadToBuffers(
+              yellowPaintTarget,
+              pBotA.clone().add(faceOff),
+              pTopA.clone().add(faceOff),
+              pTopB.clone().add(faceOff),
+              pBotB.clone().add(faceOff),
+              latOut,
+            );
+          } else {
+            appendQuadToBuffers(
+              yellowPaintTarget,
+              pTopA.clone().add(faceOff),
+              pBotA.clone().add(faceOff),
+              pBotB.clone().add(faceOff),
+              pTopB.clone().add(faceOff),
+              latOut,
+            );
+          }
+        }
       }
     };
 
@@ -2112,14 +2325,17 @@ export class IntersectionDetailBuilder {
       const cutProj =
         (mainIncoming.cut_point[0] - avgX) * rightX +
         (mainIncoming.cut_point[2] - avgZ) * rightZ;
-      const customYellow = (mainIncoming as IntersectionGroupApproach & { yellowOffsetRight?: number })
-        .yellowOffsetRight;
+      const customYellow =
+        mainIncoming.yellow_offset_right ??
+        (mainIncoming as IntersectionGroupApproach & { yellowOffsetRight?: number })
+          .yellowOffsetRight;
       if (customYellow !== undefined) {
         middleAxisProj = cutProj + customYellow;
       } else {
         const totalLanes = Math.max(1, mainIncoming.lanes);
         const inLanes = Math.max(1, mainIncoming.forward_lanes);
-        const ratio = THREE.MathUtils.clamp(inLanes / totalLanes, 0.25, 0.75);
+        const bothW = mainIncoming.lanes_both_ways && mainIncoming.lanes_both_ways > 0 ? 0.5 : 0;
+        const ratio = THREE.MathUtils.clamp((inLanes + bothW) / totalLanes, 0.25, 0.75);
         const halfW = mainIncoming.half_width;
         middleAxisProj = cutProj - halfW + ratio * (halfW * 2);
       }
@@ -2157,6 +2373,8 @@ export class IntersectionDetailBuilder {
       middleAxisProj,
       ang: Math.atan2(-outZ, outX),
       mainIncoming,
+      incomingApps,
+      outgoingApps,
       hasIncoming: incomingApps.length > 0,
       hasOutgoing: outgoingApps.length > 0,
       hasLeft,
@@ -2263,6 +2481,319 @@ export class IntersectionDetailBuilder {
 
       this.emitDashedBezierArc(paintTarget, start, ctrl, end, 0.15, (lx, lz, fbY) =>
         surfaceSampler(lx, lz, fbY) + 0.024,
+      );
+    }
+  }
+
+  /**
+   * Renders OTM Book 11 white dotted intersection continuity guide lines (0.6m dash,
+   * 0.6m gap, 0.15m width) along smooth cubic Bezier curves whenever opposing
+   * through-lanes are skewed, diagonal, or laterally offset by > 0.5m.
+   */
+  private appendThroughLaneContinuityGuideLines(
+    paintTarget: DetailBuffers,
+    legs: IntersectionGroupApproach[][],
+    surfaceSampler: (lx: number, lz: number, fallbackY: number) => number,
+    originOffset: THREE.Vector3,
+    hasCrosswalks: boolean,
+    legCrossInnerMidByIndex?: Map<number, { innerAlong: number }>,
+  ): void {
+    const infos = legs.map((legApps, idx) => ({
+      idx,
+      ...this.computeLegCrosswalkAndMiddleInfo(legApps),
+    }));
+    if (infos.length < 3) {
+      return;
+    }
+
+    // Detect non-orthogonal (diagonal / skewed) leg geometry across the intersection
+    let isDiagonalIntersection = false;
+    for (let i = 0; i < infos.length && !isDiagonalIntersection; i++) {
+      for (let j = i + 1; j < infos.length; j++) {
+        const a = infos[i]!;
+        const b = infos[j]!;
+        const dot = a.outX * b.outX + a.outZ * b.outZ;
+        if (Math.abs(dot) < 0.7 && Math.abs(dot) > 0.21) {
+          isDiagonalIntersection = true;
+          break;
+        }
+      }
+    }
+
+    const LANE_W = 3.5;
+    const isExclLeft = (tok: string): boolean => {
+      const parts = tok.split(';').map((s) => s.trim());
+      return (parts.includes('left') || parts.includes('slight_left')) && !parts.includes('through');
+    };
+    const isExclRight = (tok: string): boolean => {
+      const parts = tok.split(';').map((s) => s.trim());
+      return (parts.includes('right') || parts.includes('slight_right')) && !parts.includes('through');
+    };
+
+    for (const src of infos) {
+      if (!src.hasIncoming) {
+        continue;
+      }
+      const inTravelX = -src.outX;
+      const inTravelZ = -src.outZ;
+      const srcName = (src.mainIncoming.street_name ?? '').trim().toLowerCase();
+
+      let bestExit: (typeof infos)[number] | null = null;
+      let bestScore = 0.65;
+      for (const cand of infos) {
+        if (cand.idx === src.idx || !cand.hasOutgoing) {
+          continue;
+        }
+        const dot = cand.outX * inTravelX + cand.outZ * inTravelZ;
+        if (dot <= 0.65) {
+          continue;
+        }
+        const dstApp = cand.outgoingApps[0] ?? cand.lead;
+        const dstName = (dstApp.street_name ?? '').trim().toLowerCase();
+        const nameBonus = srcName && dstName && srcName === dstName ? 0.25 : 0;
+        const score = dot + nameBonus;
+        if (score > bestScore) {
+          bestScore = score;
+          bestExit = cand;
+        }
+      }
+      if (!bestExit) {
+        continue;
+      }
+
+      const srcIn = src.mainIncoming;
+      const dstOut = bestExit.outgoingApps[0] ?? bestExit.lead;
+      const nIn = srcIn.bidirectional ? Math.max(1, srcIn.forward_lanes) : Math.max(1, srcIn.lanes);
+      const nOut = dstOut.bidirectional ? Math.max(1, dstOut.reverse_lanes) : Math.max(1, dstOut.lanes);
+      const tSlots = srcIn.turn_lanes ?? [];
+      let exclLeft = 0;
+      while (exclLeft < nIn - 1 && exclLeft < tSlots.length && isExclLeft(tSlots[exclLeft] ?? '')) {
+        exclLeft++;
+      }
+      let exclRight = 0;
+      if (tSlots.length === nIn) {
+        while (
+          exclRight < nIn - exclLeft - 1 &&
+          isExclRight(tSlots[nIn - 1 - exclRight] ?? '')
+        ) {
+          exclRight++;
+        }
+      }
+      const nInThru = Math.max(1, nIn - exclLeft - exclRight);
+      const nThru = Math.min(nInThru, nOut);
+      if (nThru <= 0) {
+        continue;
+      }
+
+      // Compute inner yellow edge projection along each leg's right axis
+      let srcInnerYellowProj: number;
+      if (srcIn.bidirectional) {
+        const hasTwltl = (srcIn.lanes_both_ways ?? 0) > 0;
+        srcInnerYellowProj = src.middleAxisProj - (hasTwltl ? LANE_W * 0.5 : 0);
+      } else {
+        const cutProj =
+          (srcIn.cut_point[0] - src.avgX) * src.rightX +
+          (srcIn.cut_point[2] - src.avgZ) * src.rightZ;
+        srcInnerYellowProj = cutProj + (srcIn.traffic_right_offset ?? srcIn.half_width);
+      }
+
+      let dstInnerYellowProj: number;
+      if (dstOut.bidirectional) {
+        const hasTwltl = (dstOut.lanes_both_ways ?? 0) > 0;
+        const dstCutProj =
+          (dstOut.cut_point[0] - bestExit.avgX) * bestExit.rightX +
+          (dstOut.cut_point[2] - bestExit.avgZ) * bestExit.rightZ;
+        const dstCustomY =
+          dstOut.yellow_offset_right ??
+          (dstOut as IntersectionGroupApproach & { yellowOffsetRight?: number }).yellowOffsetRight;
+        const dstYProj =
+          dstCustomY !== undefined ? dstCutProj + dstCustomY : bestExit.middleAxisProj;
+        dstInnerYellowProj = dstYProj + (hasTwltl ? LANE_W * 0.5 : 0);
+      } else {
+        const cutProj =
+          (dstOut.cut_point[0] - bestExit.avgX) * bestExit.rightX +
+          (dstOut.cut_point[2] - bestExit.avgZ) * bestExit.rightZ;
+        dstInnerYellowProj = cutProj + (dstOut.traffic_left_offset ?? -dstOut.half_width);
+      }
+
+      const srcBow = THREE.MathUtils.clamp(
+        Math.max(4.0, src.maxRight - src.minRight) * 0.028,
+        0.18,
+        0.68,
+      );
+      const dstBow = THREE.MathUtils.clamp(
+        Math.max(4.0, bestExit.maxRight - bestExit.minRight) * 0.028,
+        0.18,
+        0.68,
+      );
+      const srcInnerAlong =
+        legCrossInnerMidByIndex?.get(src.idx)?.innerAlong ??
+        (hasCrosswalks ? -(CROSSWALK_DEPTH_METERS + 0.45 + 0.5 * srcBow) : -0.35);
+      const dstInnerAlong =
+        legCrossInnerMidByIndex?.get(bestExit.idx)?.innerAlong ??
+        (hasCrosswalks ? -(CROSSWALK_DEPTH_METERS + 0.45 + 0.5 * dstBow) : -0.35);
+
+      const srcEdgeProj = (edgeIdx: number): number =>
+        srcInnerYellowProj - (exclLeft + edgeIdx) * LANE_W;
+      const dstEdgeProj = (edgeIdx: number): number =>
+        dstInnerYellowProj + edgeIdx * LANE_W;
+
+      // Test lateral offset & skew between innermost through-lane centers
+      const inCenter0Proj = (srcEdgeProj(0) + srcEdgeProj(1)) * 0.5;
+      const outCenter0Proj = (dstEdgeProj(0) + dstEdgeProj(1)) * 0.5;
+      const pIn0X = src.avgX + src.outX * srcInnerAlong + src.rightX * inCenter0Proj - originOffset.x;
+      const pIn0Z = src.avgZ + src.outZ * srcInnerAlong + src.rightZ * inCenter0Proj - originOffset.z;
+      const pOut0X =
+        bestExit.avgX +
+        bestExit.outX * dstInnerAlong +
+        bestExit.rightX * outCenter0Proj -
+        originOffset.x;
+      const pOut0Z =
+        bestExit.avgZ +
+        bestExit.outZ * dstInnerAlong +
+        bestExit.rightZ * outCenter0Proj -
+        originOffset.z;
+
+      const dX0 = pOut0X - pIn0X;
+      const dZ0 = pOut0Z - pIn0Z;
+      const inRightX = -src.rightX;
+      const inRightZ = -src.rightZ;
+      const latOffset = Math.max(
+        Math.abs(dX0 * inRightX + dZ0 * inRightZ),
+        Math.abs(dX0 * bestExit.rightX + dZ0 * bestExit.rightZ),
+      );
+      const skewDot = inTravelX * bestExit.outX + inTravelZ * bestExit.outZ;
+      if (latOffset <= 0.5 && skewDot >= 0.985 && !isDiagonalIntersection) {
+        continue;
+      }
+
+      const emitOuterCurbGuide = exclRight > 0 || nInThru !== nOut || nThru === 1;
+      for (let eIdx = 0; eIdx <= nThru; eIdx++) {
+        if (eIdx === nThru && !emitOuterCurbGuide) {
+          continue;
+        }
+        const innerBias = eIdx === 0 && exclLeft === 0 && srcIn.bidirectional ? 0.18 : 0;
+        const sProj = srcEdgeProj(eIdx) - innerBias;
+        const dProj = dstEdgeProj(eIdx) + innerBias;
+
+        const sx = src.avgX + src.outX * srcInnerAlong + src.rightX * sProj - originOffset.x;
+        const sz = src.avgZ + src.outZ * srcInnerAlong + src.rightZ * sProj - originOffset.z;
+        const ex =
+          bestExit.avgX + bestExit.outX * dstInnerAlong + bestExit.rightX * dProj - originOffset.x;
+        const ez =
+          bestExit.avgZ + bestExit.outZ * dstInnerAlong + bestExit.rightZ * dProj - originOffset.z;
+
+        const p0 = new THREE.Vector3(sx, surfaceSampler(sx, sz, src.avgY - originOffset.y) + 0.024, sz);
+        const p3 = new THREE.Vector3(
+          ex,
+          surfaceSampler(ex, ez, bestExit.avgY - originOffset.y) + 0.024,
+          ez,
+        );
+        const chord = Math.hypot(p3.x - p0.x, p3.z - p0.z);
+        if (chord < 3.5 || chord > 95.0) {
+          continue;
+        }
+        const handle = THREE.MathUtils.clamp(chord * 0.36, 1.2, 24.0);
+        const p1 = new THREE.Vector3(
+          p0.x + inTravelX * handle,
+          THREE.MathUtils.lerp(p0.y, p3.y, 0.33),
+          p0.z + inTravelZ * handle,
+        );
+        const p2 = new THREE.Vector3(
+          p3.x - bestExit.outX * handle,
+          THREE.MathUtils.lerp(p0.y, p3.y, 0.67),
+          p3.z - bestExit.outZ * handle,
+        );
+
+        this.emitDottedCubicBezier(
+          paintTarget,
+          p0,
+          p1,
+          p2,
+          p3,
+          0.15,
+          0.6,
+          0.6,
+          (lx, lz, fbY) => surfaceSampler(lx, lz, fbY) + 0.024,
+        );
+      }
+    }
+  }
+
+  private emitDottedCubicBezier(
+    paintTarget: DetailBuffers,
+    p0: THREE.Vector3,
+    p1: THREE.Vector3,
+    p2: THREE.Vector3,
+    p3: THREE.Vector3,
+    widthMeters: number,
+    dashMeters: number,
+    gapMeters: number,
+    sampleArcY?: (lx: number, lz: number, fallbackY: number) => number,
+  ): void {
+    const chord = p0.distanceTo(p3);
+    if (chord < 2.0 || chord > 100.0) {
+      return;
+    }
+    const sampleCount = Math.max(16, Math.min(96, Math.ceil(chord / 0.35)));
+    const pts: THREE.Vector3[] = [];
+    const cumS: number[] = [0];
+    for (let i = 0; i <= sampleCount; i++) {
+      const t = i / sampleCount;
+      const u = 1 - t;
+      const uu = u * u;
+      const tt = t * t;
+      const x = uu * u * p0.x + 3 * uu * t * p1.x + 3 * u * tt * p2.x + tt * t * p3.x;
+      const z = uu * u * p0.z + 3 * uu * t * p1.z + 3 * u * tt * p2.z + tt * t * p3.z;
+      const fbY = uu * u * p0.y + 3 * uu * t * p1.y + 3 * u * tt * p2.y + tt * t * p3.y;
+      const y = sampleArcY ? sampleArcY(x, z, fbY) : fbY;
+      const pt = new THREE.Vector3(x, y, z);
+      pts.push(pt);
+      if (i > 0) {
+        cumS.push(cumS[i - 1]! + Math.hypot(pt.x - pts[i - 1]!.x, pt.z - pts[i - 1]!.z));
+      }
+    }
+    const totalLen = cumS[sampleCount] ?? chord;
+    if (totalLen < dashMeters) {
+      return;
+    }
+    const sampleAtS = (targetS: number): THREE.Vector3 => {
+      const s = THREE.MathUtils.clamp(targetS, 0, totalLen);
+      for (let i = 0; i < sampleCount; i++) {
+        const s0 = cumS[i]!;
+        const s1 = cumS[i + 1]!;
+        if (s <= s1 || i === sampleCount - 1) {
+          const span = s1 - s0;
+          const a = span > 1e-5 ? THREE.MathUtils.clamp((s - s0) / span, 0, 1) : 0;
+          return new THREE.Vector3().lerpVectors(pts[i]!, pts[i + 1]!, a);
+        }
+      }
+      return pts[sampleCount]!.clone();
+    };
+
+    const cycle = dashMeters + gapMeters;
+    const halfW = widthMeters * 0.5;
+    for (let sStart = 0.2; sStart + dashMeters * 0.5 <= totalLen - 0.1; sStart += cycle) {
+      const sEnd = Math.min(totalLen - 0.05, sStart + dashMeters);
+      if (sEnd - sStart < 0.2) {
+        continue;
+      }
+      const a = sampleAtS(sStart);
+      const b = sampleAtS(sEnd);
+      const dir = new THREE.Vector3(b.x - a.x, 0, b.z - a.z);
+      if (dir.lengthSq() < 1e-6) {
+        continue;
+      }
+      dir.normalize();
+      const rx = -dir.z * halfW;
+      const rz = dir.x * halfW;
+      appendQuadToBuffers(
+        paintTarget,
+        new THREE.Vector3(a.x - rx, a.y, a.z - rz),
+        new THREE.Vector3(a.x + rx, a.y, a.z + rz),
+        new THREE.Vector3(b.x + rx, b.y, b.z + rz),
+        new THREE.Vector3(b.x - rx, b.y, b.z - rz),
+        WORLD_UP,
       );
     }
   }
